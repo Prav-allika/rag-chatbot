@@ -16,6 +16,7 @@ A **Retrieval-Augmented Generation (RAG) Chatbot API** built with:
 - Fully containerized with Docker
 
 ---
+![Swagger UI](docs/swagger.png)
 
 ## 📂 Project Structure
 
