@@ -22,6 +22,9 @@ A **Retrieval-Augmented Generation (RAG) Chatbot API** built with:
 ## 📂 Project Structure
 
 Project_2/
+
+```
+
 ├── app/                     # FastAPI application code
 │   ├── __init__.py          # Makes app a package
 │   ├── main.py              # API endpoints (health, ask)
@@ -39,3 +42,4 @@ Project_2/
 ├── run_me_once.py           # Script to build vector store
 └── README.md                # Project documentation
 
+```
