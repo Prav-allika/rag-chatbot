@@ -8,3 +8,7 @@ __pycache__/
 .env
 artifacts/
 data/
+
+# Allow PDF files in data directory
+!data/*.pdf
+!data/Attention.pdf
