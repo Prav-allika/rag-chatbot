@@ -7,8 +7,8 @@ __pycache__/
 *.egg-info/
 .env
 artifacts/
-data/
 
-# Allow PDF files in data directory
+# Data directory - ignore contents but not directory itself
+data/*
+# But keep PDF files
 !data/*.pdf
-!data/Attention.pdf
