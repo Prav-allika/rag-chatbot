@@ -1,11 +1,26 @@
-fastapi
-uvicorn
-langchain
-langchain-community
-langchain-huggingface
-sentence-transformers
-faiss-cpu
-pypdf
-python-dotenv
-transformers
-torch
+# Core Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# LangChain ecosystem
+langchain>=0.1.0
+langchain-community>=0.0.16
+langchain-huggingface>=0.0.1
+
+# OpenAI (optional - only if using GPT models)
+langchain-openai>=0.0.5
+
+# Machine Learning & NLP
+sentence-transformers>=2.6.0
+transformers>=4.30.0
+torch>=2.0.0
+
+# Vector Database
+faiss-cpu>=1.7.0
+
+# Document Processing
+pypdf>=4.0.0
+
+# Configuration
+python-dotenv>=1.0.0
+

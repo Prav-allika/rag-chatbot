@@ -1,10 +1,7 @@
-"""
-RAG Pipeline - Modern LangChain 1.0+ (LCEL Pattern)
-"""
-
 import os
 import logging
 from pathlib import Path
+from typing import Optional
 from functools import lru_cache
 
 from dotenv import load_dotenv
@@ -12,12 +9,10 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQA
 from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -29,28 +24,41 @@ load_dotenv(dotenv_path=env_path)
 class Config:
     """Configuration for RAG pipeline."""
 
+    # Embeddings
     EMBEDDING_MODEL = os.getenv(
         "EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
     )
+
+    # Text Splitting
     CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 500))
     CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 50))
+
+    # Retrieval
     RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", 3))
     SEARCH_TYPE = os.getenv("SEARCH_TYPE", "similarity")
+
+    # LLM
     LLM_MODEL = os.getenv("LLM_MODEL", "google/flan-t5-base")
     LLM_MAX_LENGTH = int(os.getenv("LLM_MAX_LENGTH", 512))
     LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.7))
+
+    # OpenAI (optional)
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 
     @classmethod
-    def use_openai(cls):
+    def use_openai(cls) -> bool:
+        """Check if OpenAI should be used."""
         return bool(cls.OPENAI_API_KEY)
 
 
 # ---------- Cached Model Loading ----------
 @lru_cache(maxsize=1)
 def get_embeddings():
-    """Return embeddings model (cached)."""
+    """
+    Return embeddings model (cached).
+    Uses OpenAI if API key is set, otherwise HuggingFace (free).
+    """
     try:
         if Config.use_openai():
             logger.info("✅ Using OpenAI Embeddings")
@@ -71,7 +79,10 @@ def get_embeddings():
 
 @lru_cache(maxsize=1)
 def get_llm():
-    """Return LLM model (cached)."""
+    """
+    Return LLM model (cached).
+    Uses OpenAI if API key is set, otherwise HuggingFace.
+    """
     try:
         if Config.use_openai():
             logger.info(f"✅ Using OpenAI: {Config.OPENAI_MODEL}")
@@ -84,45 +95,39 @@ def get_llm():
             )
         else:
             logger.info(f"✅ Using HuggingFace LLM: {Config.LLM_MODEL}")
-            from transformers import (
-                AutoTokenizer,
-                AutoModelForSeq2SeqLM,
-                GenerationConfig,
-            )
+            from transformers import pipeline
             from langchain_community.llms import HuggingFacePipeline
-            from transformers import pipeline as hf_pipeline
 
-            # Load model and tokenizer
-            tokenizer = AutoTokenizer.from_pretrained(Config.LLM_MODEL)
-            model = AutoModelForSeq2SeqLM.from_pretrained(Config.LLM_MODEL)
-
-            # Create pipeline with strict generation config
-            pipe = hf_pipeline(
-                task="text2text-generation",
-                model=model,
-                tokenizer=tokenizer,
-                max_length=512,
-                do_sample=False,  # Use greedy decoding
-                temperature=0.7,
-                device=-1,
+            hf_pipeline = pipeline(
+                "text2text-generation",
+                model=Config.LLM_MODEL,
+                max_length=Config.LLM_MAX_LENGTH,
+                temperature=Config.LLM_TEMPERATURE,
+                device=-1,  # CPU
             )
-
-            return HuggingFacePipeline(
-                pipeline=pipe,
-                model_kwargs={
-                    "max_new_tokens": 150,
-                    "min_length": 20,
-                    "early_stopping": True,
-                },
-            )
+            return HuggingFacePipeline(pipeline=hf_pipeline)
     except Exception as e:
         logger.error(f"Failed to load LLM: {e}")
         raise RuntimeError(f"LLM initialization failed: {e}")
 
 
 # ---------- Vector Store Functions ----------
-def build_vector_store(pdf_path: str, store_path: str):
-    """Load PDF, split into chunks, embed, and save FAISS index."""
+def build_vector_store(pdf_path: str, store_path: str) -> FAISS:
+    """
+    Load PDF, split into chunks, embed, and save FAISS index.
+
+    Args:
+        pdf_path: Path to PDF file
+        store_path: Path to save vector store
+
+    Returns:
+        FAISS vector store
+
+    Raises:
+        FileNotFoundError: If PDF doesn't exist
+        RuntimeError: If building fails
+    """
+    # Validate PDF path
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
@@ -167,8 +172,20 @@ def build_vector_store(pdf_path: str, store_path: str):
         raise RuntimeError(f"Vector store creation failed: {e}")
 
 
-def load_vector_store(store_path: str):
-    """Load existing FAISS vector store."""
+def load_vector_store(store_path: str) -> FAISS:
+    """
+    Load existing FAISS vector store.
+
+    Args:
+        store_path: Path to vector store directory
+
+    Returns:
+        FAISS vector store
+
+    Raises:
+        FileNotFoundError: If store doesn't exist
+        RuntimeError: If loading fails
+    """
     if not os.path.exists(store_path):
         raise FileNotFoundError(
             f"Vector store not found at: {store_path}\n"
@@ -179,8 +196,11 @@ def load_vector_store(store_path: str):
         logger.info(f"📚 Loading vector store from: {store_path}")
         embeddings = get_embeddings()
 
+        # SECURITY FIX: Removed allow_dangerous_deserialization
         vector_store = FAISS.load_local(
-            store_path, embeddings, allow_dangerous_deserialization=True
+            store_path,
+            embeddings,
+            allow_dangerous_deserialization=False,  # ✅ SAFE
         )
         logger.info("✅ Vector store loaded successfully")
         return vector_store
@@ -190,11 +210,16 @@ def load_vector_store(store_path: str):
         raise RuntimeError(f"Vector store loading failed: {e}")
 
 
-# ---------- QA Chain (Modern LCEL Pattern) ----------
-def make_qa_chain(vector_store):
+# ---------- QA Chain ----------
+def make_qa_chain(vector_store: FAISS) -> RetrievalQA:
     """
-    Build QA chain using modern LangChain 1.0+ LCEL pattern.
-    Returns a wrapper that mimics old RetrievalQA interface.
+    Build RetrievalQA chain with custom prompt.
+
+    Args:
+        vector_store: FAISS vector store
+
+    Returns:
+        RetrievalQA chain
     """
     try:
         # Create retriever
@@ -203,7 +228,7 @@ def make_qa_chain(vector_store):
         )
 
         # Custom prompt template
-        template = """Use the following pieces of context to answer the question at the end. 
+        prompt_template = """Use the following pieces of context to answer the question at the end. 
 If you don't know the answer, just say that you don't know, don't try to make up an answer.
 Keep your answer concise and relevant.
 
@@ -214,58 +239,25 @@ Question: {question}
 
 Helpful Answer:"""
 
-        prompt = PromptTemplate(
-            template=template, input_variables=["context", "question"]
+        PROMPT = PromptTemplate(
+            template=prompt_template, input_variables=["context", "question"]
         )
 
         # Get LLM
         llm = get_llm()
 
-        # Helper function to format retrieved documents
-        def format_docs(docs):
-            return "\n\n".join(doc.page_content for doc in docs)
-
-        # Build LCEL chain
-        logger.info("🔗 Building QA chain (LCEL pattern)...")
-        rag_chain = (
-            {"context": retriever | format_docs, "question": RunnablePassthrough()}
-            | prompt
-            | llm
-            | StrOutputParser()
+        # Build chain
+        logger.info("🔗 Building QA chain...")
+        chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=retriever,
+            chain_type_kwargs={"prompt": PROMPT},
+            return_source_documents=False,
         )
 
-        # Wrapper class to mimic old RetrievalQA interface
-        class QAChainWrapper:
-            """Wrapper to make LCEL chain compatible with old RetrievalQA interface."""
-
-            def __init__(self, chain):
-                self._chain = chain
-
-            def invoke(self, inputs):
-                """
-                Accepts inputs dict with 'query' or 'question' key.
-                Returns dict with 'result' key.
-                """
-                # Extract question from inputs
-                question = inputs.get("query") or inputs.get("question")
-                if not question:
-                    raise ValueError("No question provided in inputs")
-
-                # Run chain
-                result = self._chain.invoke(question)
-
-                # Return in expected format
-                return {"result": result}
-
-            # For backwards compatibility
-            def run(self, question):
-                """Old-style synchronous run method."""
-                result = self._chain.invoke(question)
-                return result
-
-        wrapped_chain = QAChainWrapper(rag_chain)
-        logger.info("✅ QA chain built successfully (LCEL)")
-        return wrapped_chain
+        logger.info("✅ QA chain built successfully")
+        return chain
 
     except Exception as e:
         logger.error(f"Failed to create QA chain: {e}")
@@ -273,8 +265,16 @@ Helpful Answer:"""
 
 
 # ---------- Helper Functions ----------
-def get_vector_store_info(store_path: str):
-    """Get information about vector store."""
+def get_vector_store_info(store_path: str) -> dict:
+    """
+    Get information about vector store.
+
+    Args:
+        store_path: Path to vector store
+
+    Returns:
+        Dictionary with store information
+    """
     if not os.path.exists(store_path):
         return {"exists": False}
 
