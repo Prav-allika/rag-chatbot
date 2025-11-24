@@ -1,16 +1,17 @@
-# 🧠 RAG Chatbot API
+#  RAG Chatbot API
 
 **Production-ready document Q&A system powered by Retrieval-Augmented Generation**
 
-[![🚀 Live Demo](https://img.shields.io/badge/Demo-Try%20Now-brightgreen?style=for-the-badge)]()
-[![📖 API Docs](https://img.shields.io/badge/Docs-Swagger-85EA2D?style=for-the-badge&logo=swagger)](http://localhost:8000/docs)
-[![💻 Code](https://img.shields.io/badge/GitHub-Source-black?style=for-the-badge&logo=github)](https://github.com/Prav-allika/rag-chatbot)
+
+[![ Live Demo](https://img.shields.io/badge/Demo-Try%20Now-brightgreen?style=for-the-badge)](http://localhost:8000/docs)
+[![ API Docs](https://img.shields.io/badge/Docs-Swagger-85EA2D?style=for-the-badge&logo=swagger)](http://localhost:8000/docs)
+[![ GitHub](https://img.shields.io/badge/GitHub-Source-black?style=for-the-badge&logo=github)](https://github.com/Prav-allika/rag-chatbot)
 
 > **LangChain + FAISS + FastAPI + Docker** | **Handles 10K+ documents** | **Sub-second responses**
 
 ---
 
-## 🎯 Problem Statement
+##  Problem Statement
 
 Reading and analyzing large document collections is time-consuming and doesn't scale. Organizations need automated systems to:
 - Extract relevant information from thousands of documents instantly
@@ -20,27 +21,27 @@ Reading and analyzing large document collections is time-consuming and doesn't s
 **Solution:** This RAG system combines intelligent retrieval with AI generation to provide accurate, context-aware answers from document collections in under 2 seconds, enabling users to query documents as if asking a human expert.
 
 ### Real-World Use Cases
-- 📚 **Legal Research**: Query case documents, contracts, and legal briefs
-- 🏥 **Healthcare**: Analyze medical literature and patient records
-- 📊 **Financial Analysis**: Extract insights from reports and statements
-- 🎓 **Academic Research**: Search through papers and publications
+-  **Legal Research**: Query case documents, contracts, and legal briefs
+-  **Healthcare**: Analyze medical literature and patient records
+-  **Financial Analysis**: Extract insights from reports and statements
+-  **Academic Research**: Search through papers and publications
 
 ---
 
-## ✨ Key Features
+##  Key Features
 
-- 🚀 **Fast Processing**: Sub-second query responses with FAISS vector search
-- 🎯 **High Accuracy**: Context-aware answers using RAG architecture
-- 📄 **PDF Support**: Automatic document parsing and indexing
-- 🔌 **REST API**: Production-ready FastAPI with comprehensive documentation
-- 🐳 **Docker Ready**: Fully containerized for easy deployment
-- 🔄 **Flexible Models**: Supports both free HuggingFace and OpenAI models
-- 📊 **Scalable**: Handles 10,000+ document chunks efficiently
-- 🔒 **Secure**: No dangerous deserialization, proper error handling
+-  **Fast Processing**: Sub-second query responses with FAISS vector search
+-  **High Accuracy**: Context-aware answers using RAG architecture
+-  **PDF Support**: Automatic document parsing and indexing
+-  **REST API**: Production-ready FastAPI with comprehensive documentation
+-  **Docker Ready**: Fully containerized for easy deployment
+-  **Flexible Models**: Supports both free HuggingFace and OpenAI models
+-  **Scalable**: Handles 10,000+ document chunks efficiently
+-  **Secure**: No dangerous deserialization, proper error handling
 
 ---
 
-## 📊 Performance Metrics
+##  Performance Metrics
 
 | Metric | Value |
 |--------|-------|
@@ -58,7 +59,7 @@ Reading and analyzing large document collections is time-consuming and doesn't s
 
 ---
 
-## 🏗️ Architecture
+##  Architecture
 
 ```
 User Query → FastAPI → RAG Pipeline → Vector Store (FAISS)
@@ -91,7 +92,7 @@ User Query → FastAPI → RAG Pipeline → Vector Store (FAISS)
 
 ---
 
-## 🚀 Quick Start
+##  Quick Start
 
 ### Prerequisites
 - Python 3.10+
@@ -166,7 +167,7 @@ uvicorn app.main:app --reload
 
 ---
 
-## 📡 API Usage
+##  API Usage
 
 ### Health Check
 
@@ -235,7 +236,7 @@ fetch('http://localhost:8000/ask', {
 
 ---
 
-## 🛠️ Configuration
+##  Configuration
 
 ### Environment Variables
 
@@ -276,7 +277,7 @@ LLM_TEMPERATURE=0.7
 
 ---
 
-## 📁 Project Structure
+##  Project Structure
 
 ```
 rag-chatbot/
@@ -306,7 +307,7 @@ rag-chatbot/
 
 ---
 
-## 🧪 Building Vector Store from Your Documents
+##  Building Vector Store from Your Documents
 
 ### Basic Usage
 
@@ -347,7 +348,7 @@ python run_me_once.py --pdf data/doc2.pdf --force
 
 ---
 
-## 🔍 How It Works
+##  How It Works
 
 ### RAG (Retrieval-Augmented Generation) Explained
 
@@ -360,15 +361,15 @@ python run_me_once.py --pdf data/doc2.pdf --force
 
 ### Why RAG?
 
-- ✅ **Accurate**: Answers grounded in actual documents
-- ✅ **Transparent**: Can trace answers back to sources
-- ✅ **Up-to-date**: Works with your latest documents
-- ✅ **No hallucinations**: Less likely to make up information
-- ✅ **Domain-specific**: Tailored to your documents
+-  **Accurate**: Answers grounded in actual documents
+-  **Transparent**: Can trace answers back to sources
+-  **Up-to-date**: Works with your latest documents
+-  **No hallucinations**: Less likely to make up information
+-  **Domain-specific**: Tailored to your documents
 
 ---
 
-## 🎯 Advanced Features
+##  Advanced Features
 
 ### Custom Prompt Templates
 
@@ -413,7 +414,7 @@ logging.basicConfig(
 
 ---
 
-## 🚀 Deployment
+##  Deployment
 
 ### Deploy to Render.com (Free Tier)
 
@@ -453,7 +454,7 @@ docker run -d -p 80:8000 rag-chatbot
 
 ---
 
-## 🧩 Troubleshooting
+##  Troubleshooting
 
 ### Common Issues
 
@@ -507,7 +508,7 @@ python run_me_once.py --force
 
 ---
 
-## 🤝 Contributing
+##  Contributing
 
 Contributions are welcome! Please follow these steps:
 
@@ -525,7 +526,7 @@ This project is licensed under the MIT License - see LICENSE file for details.
 
 ---
 
-## 👤 Author
+##  Author
 
 **Pasala Pravallika**
 
@@ -546,7 +547,7 @@ This project is licensed under the MIT License - see LICENSE file for details.
 
 ---
 
-## ⭐ Star History
+##  Star History
 
 If you find this project helpful, please give it a ⭐!
 
@@ -563,4 +564,3 @@ Check out my other ML projects:
 
 ---
 
-**Last Updated:** November 2024 | **Version:** 1.0.0
