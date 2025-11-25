@@ -3,10 +3,10 @@ import os
 from app.rag_pipeline import load_vector_store, make_qa_chain
 
 # Load pre-built vector store
-print("Loading vector store...")
+print("🚀 Loading vector store...")
 vector_store = load_vector_store("artifacts/vector_store")
 qa_chain = make_qa_chain(vector_store)
-print("Ready!")
+print("✅ Ready!")
 
 def answer_question(question):
     """Answer questions about the Attention paper"""
@@ -28,7 +28,7 @@ demo = gr.Interface(
         lines=2
     ),
     outputs=gr.Textbox(label="Answer", lines=5),
-    title="�� RAG Chatbot - Attention Paper Q&A",
+    title="🤖 RAG Chatbot - Attention Paper Q&A",
     description="Ask questions about the Transformer architecture paper using RAG (Retrieval-Augmented Generation)",
     examples=[
         "What is the attention mechanism?",

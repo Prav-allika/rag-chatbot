@@ -25,3 +25,4 @@ pypdf>=4.0.0
 python-dotenv>=1.0.0
 
 gradio
+gradio>=4.0.0
