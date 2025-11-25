@@ -9,7 +9,7 @@ __pycache__/
 .env
 
 # Artifacts
-artifacts/
+#artifacts/
 
 # IDE
 .vscode/
