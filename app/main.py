@@ -5,6 +5,7 @@ FastAPI application for RAG Chatbot
 import os
 import time
 import logging
+import urllib.request
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -21,6 +22,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ---------- Helper Functions ----------
+def ensure_pdf_exists():
+    """Download PDF from GitHub if it doesn't exist locally"""
+    pdf_path = "data/Attention.pdf"
+
+    if not os.path.exists(pdf_path):
+        logger.warning(" PDF not found locally. Downloading from GitHub...")
+
+        # Create data directory
+        os.makedirs("data", exist_ok=True)
+
+        # GitHub raw URL for your PDF
+        pdf_url = (
+            "https://github.com/Prav-allika/rag-chatbot/raw/main/data/Attention.pdf"
+        )
+
+        try:
+            logger.info(f" Downloading PDF from {pdf_url}")
+            urllib.request.urlretrieve(pdf_url, pdf_path)
+            logger.info(
+                f" PDF downloaded successfully ({os.path.getsize(pdf_path)} bytes)"
+            )
+        except Exception as e:
+            logger.error(f" Failed to download PDF: {e}")
+            raise FileNotFoundError(f"Could not download PDF from {pdf_url}")
+    else:
+        logger.info(
+            f" PDF already exists at {pdf_path} ({os.path.getsize(pdf_path)} bytes)"
+        )
+
+    return pdf_path
+
+
 # Global variables for vector store and QA chain
 vector_store = None
 qa_chain = None
@@ -36,16 +71,13 @@ async def lifespan(app: FastAPI):
 
     try:
         store_path = "artifacts/vector_store"
-        pdf_path = "data/Attention.pdf"
+
+        # Ensure PDF exists (download if missing)
+        pdf_path = ensure_pdf_exists()
 
         # Check if vector store exists
         if not os.path.exists(store_path):
             logger.warning(" Vector store not found. Building now...")
-
-            # Check if PDF exists
-            if not os.path.exists(pdf_path):
-                logger.error(f" PDF not found at: {pdf_path}")
-                raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
             # Build vector store
             logger.info(" Building vector store (first startup takes 2-3 minutes)...")
@@ -55,7 +87,7 @@ async def lifespan(app: FastAPI):
             logger.info(" Vector store built successfully!")
         else:
             # Load existing vector store
-            logger.info("📚 Loading existing vector store...")
+            logger.info(" Loading existing vector store...")
             vector_store = load_vector_store(store_path)
 
         # Create QA chain
@@ -211,7 +243,7 @@ async def ask_question(payload: QuestionRequest):
         answer = result.get("result", "No answer generated")
 
         processing_time = time.time() - start_time
-        logger.info(f" Answer generated in {processing_time:.2f}s")
+        logger.info(f"✅ Answer generated in {processing_time:.2f}s")
 
         return AnswerResponse(
             answer=answer, processing_time=round(processing_time, 3), status="success"

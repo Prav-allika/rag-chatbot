@@ -1,12 +1,17 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.db
-*.sqlite3
 *.egg-info/
+
+# Environment
 .env
+
+# Artifacts
 artifacts/
 
-# Data directory - ignore contents but not directory itself
-# But keep PDF files
+# IDE
+.vscode/
+.idea/
+*.DS_Store
