@@ -1,3 +1,13 @@
+# 🤖 RAG Chatbot - Attention Paper Q&A
+
+[![🚀 Live Demo](https://img.shields.io/badge/Demo-Try%20Now-brightgreen?style=for-the-badge&logo=huggingface)](https://huggingface.co/spaces/Prav04/rag-chatbot)
+[![GitHub](https://img.shields.io/badge/Code-GitHub-black?style=for-the-badge&logo=github)](https://github.com/Prav-allika/rag-chatbot)
+
+**🎯 Try it live:** https://huggingface.co/spaces/Prav04/rag-chatbot
+
+A production-ready RAG (Retrieval-Augmented Generation) chatbot deployed on HuggingFace Spaces that answers questions about the "Attention Is All You Need" paper using FAISS vector search and LangChain.
+
+---
 #  RAG Chatbot API
 
 **Production-ready document Q&A system powered by Retrieval-Augmented Generation**
