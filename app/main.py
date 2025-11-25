@@ -29,7 +29,7 @@ def ensure_pdf_exists():
     pdf_path = "data/Attention.pdf"
 
     if not os.path.exists(pdf_path):
-        logger.warning("⚠️ PDF not found locally. Downloading from GitHub...")
+        logger.warning(" PDF not found locally. Downloading from GitHub...")
 
         # Create data directory
         os.makedirs("data", exist_ok=True)
@@ -43,14 +43,14 @@ def ensure_pdf_exists():
             logger.info(f" Downloading PDF from {pdf_url}")
             urllib.request.urlretrieve(pdf_url, pdf_path)
             logger.info(
-                f"✅ PDF downloaded successfully ({os.path.getsize(pdf_path)} bytes)"
+                f" PDF downloaded successfully ({os.path.getsize(pdf_path)} bytes)"
             )
         except Exception as e:
             logger.error(f" Failed to download PDF: {e}")
             raise FileNotFoundError(f"Could not download PDF from {pdf_url}")
     else:
         logger.info(
-            f"✅ PDF already exists at {pdf_path} ({os.path.getsize(pdf_path)} bytes)"
+            f" PDF already exists at {pdf_path} ({os.path.getsize(pdf_path)} bytes)"
         )
 
     return pdf_path
@@ -243,7 +243,7 @@ async def ask_question(payload: QuestionRequest):
         answer = result.get("result", "No answer generated")
 
         processing_time = time.time() - start_time
-        logger.info(f"✅ Answer generated in {processing_time:.2f}s")
+        logger.info(f" Answer generated in {processing_time:.2f}s")
 
         return AnswerResponse(
             answer=answer, processing_time=round(processing_time, 3), status="success"
