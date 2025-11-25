@@ -9,6 +9,4 @@ __pycache__/
 artifacts/
 
 # Data directory - ignore contents but not directory itself
-data/*
 # But keep PDF files
-!data/*.pdf
