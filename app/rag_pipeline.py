@@ -41,10 +41,16 @@ class Config:
     LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.7))
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
 
     @classmethod
     def use_openai(cls):
         return bool(cls.OPENAI_API_KEY)
+
+    @classmethod
+    def use_groq(cls):
+        return bool(cls.GROQ_API_KEY)
 
 
 # ---------- Cached Model Loading ----------
@@ -53,12 +59,12 @@ def get_embeddings():
     """Return embeddings model (cached)."""
     try:
         if Config.use_openai():
-            logger.info("✅ Using OpenAI Embeddings")
+            logger.info("Using OpenAI Embeddings")
             from langchain_openai import OpenAIEmbeddings
 
             return OpenAIEmbeddings(openai_api_key=Config.OPENAI_API_KEY)
         else:
-            logger.info(f"✅ Using HuggingFace Embeddings: {Config.EMBEDDING_MODEL}")
+            logger.info(f"Using HuggingFace Embeddings: {Config.EMBEDDING_MODEL}")
             return HuggingFaceEmbeddings(
                 model_name=Config.EMBEDDING_MODEL,
                 model_kwargs={"device": "cpu"},
@@ -71,10 +77,26 @@ def get_embeddings():
 
 @lru_cache(maxsize=1)
 def get_llm():
-    """Return LLM model (cached)."""
+    """Return LLM model (cached).
+
+    Priority order:
+      1. Groq  — fastest, generous free tier (set GROQ_API_KEY)
+      2. OpenAI — best quality (set OPENAI_API_KEY)
+      3. HuggingFace FLAN-T5 — fully local, no API key needed (slow on CPU)
+    """
     try:
-        if Config.use_openai():
-            logger.info(f"✅ Using OpenAI: {Config.OPENAI_MODEL}")
+        if Config.use_groq():
+            logger.info(f"Using Groq: {Config.GROQ_MODEL}")
+            from langchain_groq import ChatGroq
+
+            return ChatGroq(
+                model=Config.GROQ_MODEL,
+                groq_api_key=Config.GROQ_API_KEY,
+                temperature=Config.LLM_TEMPERATURE,
+            )
+
+        elif Config.use_openai():
+            logger.info(f"Using OpenAI: {Config.OPENAI_MODEL}")
             from langchain_openai import ChatOpenAI
 
             return ChatOpenAI(
@@ -83,7 +105,7 @@ def get_llm():
                 temperature=Config.LLM_TEMPERATURE,
             )
         else:
-            logger.info(f"✅ Using HuggingFace LLM: {Config.LLM_MODEL}")
+            logger.info(f"Using HuggingFace LLM: {Config.LLM_MODEL}")
             from transformers import (
                 AutoTokenizer,
                 AutoModelForSeq2SeqLM,
@@ -102,7 +124,7 @@ def get_llm():
                 model=model,
                 tokenizer=tokenizer,
                 max_length=512,
-                do_sample=False,  # Use greedy decoding
+                do_sample=False,
                 temperature=0.7,
                 device=-1,
             )
@@ -127,18 +149,17 @@ def build_vector_store(pdf_path: str, store_path: str):
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
     try:
-        logger.info(f"📄 Loading PDF: {pdf_path}")
+        logger.info(f"Loading PDF: {pdf_path}")
         loader = PyPDFLoader(pdf_path)
         docs = loader.load()
 
         if not docs:
             raise ValueError("No documents loaded from PDF")
 
-        logger.info(f"✅ Loaded {len(docs)} pages")
+        logger.info(f"Loaded {len(docs)} pages")
 
-        # Split documents
         logger.info(
-            f"✂️ Splitting into chunks (size={Config.CHUNK_SIZE}, overlap={Config.CHUNK_OVERLAP})"
+            f"Splitting into chunks (size={Config.CHUNK_SIZE}, overlap={Config.CHUNK_OVERLAP})"
         )
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=Config.CHUNK_SIZE,
@@ -147,18 +168,16 @@ def build_vector_store(pdf_path: str, store_path: str):
             separators=["\n\n", "\n", " ", ""],
         )
         chunks = splitter.split_documents(docs)
-        logger.info(f"✅ Created {len(chunks)} chunks")
+        logger.info(f"Created {len(chunks)} chunks")
 
-        # Create embeddings and build vector store
-        logger.info("🔢 Creating embeddings...")
+        logger.info("Creating embeddings...")
         embeddings = get_embeddings()
         vector_store = FAISS.from_documents(chunks, embeddings)
 
-        # Save vector store
-        logger.info(f"💾 Saving vector store to: {store_path}")
+        logger.info(f"Saving vector store to: {store_path}")
         os.makedirs(os.path.dirname(store_path), exist_ok=True)
         vector_store.save_local(store_path)
-        logger.info("✅ Vector store saved successfully")
+        logger.info("Vector store saved successfully")
 
         return vector_store
 
@@ -176,13 +195,13 @@ def load_vector_store(store_path: str):
         )
 
     try:
-        logger.info(f"📚 Loading vector store from: {store_path}")
+        logger.info(f"Loading vector store from: {store_path}")
         embeddings = get_embeddings()
 
         vector_store = FAISS.load_local(
             store_path, embeddings, allow_dangerous_deserialization=True
         )
-        logger.info("✅ Vector store loaded successfully")
+        logger.info("Vector store loaded successfully")
         return vector_store
 
     except Exception as e:
@@ -194,39 +213,34 @@ def load_vector_store(store_path: str):
 def make_qa_chain(vector_store):
     """
     Build QA chain using modern LangChain 1.0+ LCEL pattern.
-    Returns a wrapper that mimics old RetrievalQA interface.
+    Supports: source chunk retrieval, follow-up context via history.
     """
     try:
-        # Create retriever
         retriever = vector_store.as_retriever(
             search_type=Config.SEARCH_TYPE, search_kwargs={"k": Config.RETRIEVAL_K}
         )
 
-        # Custom prompt template
-        template = """Use the following pieces of context to answer the question at the end. 
-If you don't know the answer, just say that you don't know, don't try to make up an answer.
-Keep your answer concise and relevant.
+        template = """Use the following context from the document to answer the question.
+If previous conversation is provided, use it to understand follow-up questions.
+If you don't know the answer from the context, say so clearly. Keep your answer concise.
 
-Context:
+Document context:
 {context}
 
 Question: {question}
 
-Helpful Answer:"""
+Answer:"""
 
         prompt = PromptTemplate(
             template=template, input_variables=["context", "question"]
         )
 
-        # Get LLM
         llm = get_llm()
 
-        # Helper function to format retrieved documents
         def format_docs(docs):
             return "\n\n".join(doc.page_content for doc in docs)
 
-        # Build LCEL chain
-        logger.info("🔗 Building QA chain (LCEL pattern)...")
+        logger.info("Building QA chain (LCEL pattern)...")
         rag_chain = (
             {"context": retriever | format_docs, "question": RunnablePassthrough()}
             | prompt
@@ -234,37 +248,58 @@ Helpful Answer:"""
             | StrOutputParser()
         )
 
-        # Wrapper class to mimic old RetrievalQA interface
         class QAChainWrapper:
-            """Wrapper to make LCEL chain compatible with old RetrievalQA interface."""
+            """
+            Wrapper supporting:
+            - Source chunk retrieval (returns paragraphs used for the answer)
+            - Follow-up context (injects recent conversation history into question)
+            """
 
-            def __init__(self, chain):
+            def __init__(self, chain, retriever):
                 self._chain = chain
+                self._retriever = retriever
 
             def invoke(self, inputs):
-                """
-                Accepts inputs dict with 'query' or 'question' key.
-                Returns dict with 'result' key.
-                """
-                # Extract question from inputs
                 question = inputs.get("query") or inputs.get("question")
+                history = inputs.get("history", "").strip()
+
                 if not question:
                     raise ValueError("No question provided in inputs")
 
+                # Inject recent history for follow-up question support
+                if history:
+                    recent = history[-500:] if len(history) > 500 else history
+                    full_question = (
+                        f"[Conversation so far for context]\n{recent}\n\n"
+                        f"[Current question]: {question}"
+                    )
+                else:
+                    full_question = question
+
+                # Fetch source docs separately for display
+                source_docs = self._retriever.invoke(question)
+
                 # Run chain
-                result = self._chain.invoke(question)
+                result = self._chain.invoke(full_question)
 
-                # Return in expected format
-                return {"result": result}
+                # Format source chunks
+                sources = []
+                for i, doc in enumerate(source_docs):
+                    sources.append(
+                        {
+                            "chunk": i + 1,
+                            "content": doc.page_content[:300],
+                            "page": doc.metadata.get("page", "N/A"),
+                        }
+                    )
 
-            # For backwards compatibility
+                return {"result": result, "sources": sources}
+
             def run(self, question):
-                """Old-style synchronous run method."""
-                result = self._chain.invoke(question)
-                return result
+                return self._chain.invoke(question)
 
-        wrapped_chain = QAChainWrapper(rag_chain)
-        logger.info("✅ QA chain built successfully (LCEL)")
+        wrapped_chain = QAChainWrapper(rag_chain, retriever)
+        logger.info("QA chain built successfully (LCEL)")
         return wrapped_chain
 
     except Exception as e:
