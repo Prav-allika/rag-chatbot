@@ -1,200 +1,143 @@
-# RAG Chatbot - Attention Paper Q&A
+# RAG Chatbot — Chat with Any PDF
 
-[![Live Demo](https://img.shields.io/badge/Demo-Try%20Now-brightgreen?style=for-the-badge&logo=huggingface)](https://huggingface.co/spaces/Prav04/rag-chatbot)
-[![GitHub](https://img.shields.io/badge/Code-GitHub-black?style=for-the-badge&logo=github)](https://github.com/Prav-allika/rag-chatbot)
+A production-ready Retrieval-Augmented Generation (RAG) chatbot that lets you upload any PDF and ask questions about it. Built with LangChain, FAISS, Groq LLaMA 3.3, and Gradio.
 
-**Try it live:** https://huggingface.co/spaces/Prav04/rag-chatbot
-
-A production-ready RAG (Retrieval-Augmented Generation) chatbot deployed on HuggingFace Spaces that answers questions about the "Attention Is All You Need" paper using FAISS vector search and LangChain.
+**Live Demo**: [huggingface.co/spaces/Prav04/rag-chatbot](https://huggingface.co/spaces/Prav04/rag-chatbot)
 
 ---
 
-## Overview
-
-This chatbot uses Retrieval-Augmented Generation (RAG) to answer questions about the Transformer architecture paper. It combines:
-
-- **FAISS** for efficient vector similarity search
-- **LangChain** for RAG pipeline orchestration
-- **HuggingFace Transformers** for embeddings and text generation
-- **Gradio** for the interactive web interface
-
 ## Features
 
-- **Instant Answers**: Sub-second response times using pre-built vector store
-- **Accurate Retrieval**: FAISS vector search with semantic understanding
-- **Natural Language**: Ask questions in plain English
-- **Production Ready**: Deployed on HuggingFace Spaces with 99.9% uptime
+- **Upload any PDF** — not locked to one document
+- **Multi-PDF support** — load multiple PDFs and switch between them mid-session
+- **Fast responses** — powered by Groq LLaMA 3.3 (70B), ~1 second per answer
+- **Chat history** — full conversation log with timestamps
+- **Follow-up questions** — context-aware answers using recent conversation history
+- **Source chunks** — see exactly which paragraphs from the PDF were used to generate the answer
+- **Session stats** — live question counter and active PDF tracker
+- **Copy last answer** — click inside the answer box to select and copy
 
-## Technology Stack
+---
 
-- **Python 3.10**
-- **LangChain 1.0+** - Modern LCEL patterns for RAG pipeline
-- **FAISS** - Vector similarity search
-- **Sentence Transformers** - Document embeddings (all-MiniLM-L6-v2)
-- **Google Flan-T5** - Text generation model
-- **Gradio 4.0+** - Web interface
-- **HuggingFace Spaces** - Deployment platform
+## Tech Stack
 
-## Architecture
+| Component | Technology |
+|---|---|
+| LLM | Groq LLaMA 3.3 70B (or OpenAI GPT-3.5) |
+| Embeddings | sentence-transformers/all-MiniLM-L6-v2 |
+| Vector Store | FAISS |
+| RAG Framework | LangChain (LCEL pattern) |
+| UI | Gradio |
+| API | FastAPI |
 
+---
+
+## Quick Start
+
+**1. Clone the repo**
+```bash
+git clone https://github.com/Prav-allika/rag-chatbot.git
+cd rag-chatbot
 ```
-User Question
-    ↓
-[Text Embedding]
-    ↓
-[FAISS Vector Search] → Retrieve relevant document chunks
-    ↓
-[LangChain LCEL Pipeline] → Context + Question
-    ↓
-[Flan-T5 Model] → Generate answer
-    ↓
-Response to User
+
+**2. Create a virtual environment**
+```bash
+conda create -n rag-chatbot python=3.10 -y
+conda activate rag-chatbot
 ```
+
+**3. Install dependencies**
+```bash
+pip install -r requirements.txt
+```
+
+**4. Set up environment variables**
+```bash
+cp .env.example .env
+```
+
+Open `.env` and add your Groq API key:
+```
+GROQ_API_KEY=your_key_here
+```
+
+Get a free Groq key at [console.groq.com](https://console.groq.com) — 14,400 requests/day free.
+
+**5. Run the app**
+```bash
+python app.py
+```
+
+Open [http://127.0.0.1:7860](http://127.0.0.1:7860) in your browser.
+
+---
+
+## LLM Options
+
+The app supports three LLM backends — set in `.env`:
+
+| Option | Speed | Cost | Setup |
+|---|---|---|---|
+| Groq (recommended) | ~1 second | Free (14k req/day) | `GROQ_API_KEY=...` |
+| OpenAI | ~2 seconds | ~$0.002/query | `OPENAI_API_KEY=...` |
+| Local FLAN-T5 | ~15 seconds | Free | No key needed |
+
+---
 
 ## Project Structure
 
 ```
 rag-chatbot/
+├── app.py                  # Gradio UI with all features
 ├── app/
-│   ├── __init__.py
-│   ├── main.py              # FastAPI application (optional)
-│   └── rag_pipeline.py      # RAG implementation
-├── artifacts/
-│   └── vector_store/        # Pre-built FAISS index
-│       ├── index.faiss
-│       └── index.pkl
-├── data/
-│   └── Attention.pdf        # Source document
-├── app.py                   # Gradio interface (HuggingFace)
-├── requirements.txt         # Python dependencies
-├── run_me_once.py          # Vector store builder
-└── README.md
+│   ├── rag_pipeline.py     # Embeddings, FAISS, QA chain, Groq LLM
+│   └── main.py             # FastAPI backend
+├── run_me_once.py          # Build vector store from PDF
+├── .env.example            # Environment variable template
+└── requirements.txt
 ```
-
-## Local Setup
-
-### Prerequisites
-
-- Python 3.10+
-- 4GB RAM minimum
-- 2GB disk space
-
-### Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/Prav-allika/rag-chatbot.git
-cd rag-chatbot
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Build vector store (one-time setup)
-python run_me_once.py --pdf data/Attention.pdf
-```
-
-### Run Locally
-
-**Option 1: Gradio Interface (Recommended)**
-
-```bash
-python app.py
-```
-
-Visit `http://localhost:7860` to use the chatbot.
-
-**Option 2: FastAPI (API Mode)**
-
-```bash
-uvicorn app.main:app --reload
-```
-
-Visit `http://localhost:8000/docs` for API documentation.
-
-## Example Questions
-
-Try asking:
-
-- "What is the attention mechanism?"
-- "How does multi-head attention work?"
-- "What are the key advantages of the Transformer model?"
-- "Explain positional encoding in simple terms"
-- "What is self-attention?"
-
-## Deployment
-
-This project is deployed on HuggingFace Spaces:
-
-- **Platform**: HuggingFace Spaces (Free tier)
-- **Hardware**: CPU Basic (16GB RAM)
-- **Uptime**: 99.9%
-- **URL**: https://huggingface.co/spaces/Prav04/rag-chatbot
-
-### Deploy Your Own
-
-1. Fork this repository
-2. Create a new Space on HuggingFace
-3. Connect your forked repository
-4. The Space will automatically deploy
-
-Git LFS is required for binary files (PDF, FAISS index). The `.gitattributes` file is already configured.
-
-## Performance
-
-- **Startup Time**: 2-3 minutes (first load only)
-- **Response Time**: < 2 seconds per query
-- **Vector Store**: 195KB (2 files)
-- **Concurrent Users**: Supports multiple simultaneous queries
-
-## Technical Details
-
-### RAG Pipeline (LCEL Pattern)
-
-```python
-chain = (
-    {"context": retriever | format_docs, "question": RunnablePassthrough()}
-    | prompt
-    | llm
-    | StrOutputParser()
-)
-```
-
-### Vector Store
-
-- **Embedding Model**: sentence-transformers/all-MiniLM-L6-v2
-- **Chunk Size**: 500 characters
-- **Chunk Overlap**: 50 characters
-- **Total Chunks**: 93 from 15 pages
-- **Index Size**: 143KB (FAISS)
-
-## Future Enhancements
-
-- [ ] Support for multiple documents
-- [ ] Conversation history
-- [ ] Citation tracking
-- [ ] Advanced filtering options
-- [ ] API rate limiting
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## License
-
-MIT License - See LICENSE file for details
-
-## Acknowledgments
-
-- Paper: "Attention Is All You Need" (Vaswani et al., 2017)
-- Built with LangChain, FAISS, and HuggingFace Transformers
-- Deployed on HuggingFace Spaces
-
-## Contact
-
-**Pravalli**
-- GitHub: [@Prav-allika](https://github.com/Prav-allika)
-- HuggingFace: [@Prav04](https://huggingface.co/Prav04)
 
 ---
 
-**Live Demo**: https://huggingface.co/spaces/Prav04/rag-chatbot
+## How It Works
+
+```
+User uploads PDF
+      |
+      v
+PDF split into chunks (500 chars, 50 overlap)
+      |
+      v
+Chunks embedded using sentence-transformers
+      |
+      v
+Embeddings stored in FAISS vector store
+      |
+      v
+User asks a question
+      |
+      v
+Question embedded → top 3 similar chunks retrieved
+      |
+      v
+Chunks + question sent to Groq LLaMA 3.3
+      |
+      v
+Answer + source chunks returned to UI
+```
+
+---
+
+## Deployment on HuggingFace Spaces
+
+1. Fork this repo
+2. Create a new Space at [huggingface.co/spaces](https://huggingface.co/spaces)
+3. Connect your GitHub repo
+4. Add `GROQ_API_KEY` in Settings → Variables and secrets
+
+---
+
+## Author
+
+**Pravalli** — ML Engineer  
+[GitHub](https://github.com/Prav-allika) · [HuggingFace](https://huggingface.co/Prav04)
