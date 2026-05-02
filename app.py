@@ -65,45 +65,57 @@ def _delete_history(doc_name: str) -> None:
             pass
 
 
-# ---------- Phase 3 — Human Feedback (Redis-backed) ----------
+# ---------- Phase 3 — Human Feedback (Redis-backed + in-memory fallback) ----------
+_feedback_mem: dict = {}   # {doc_name: [{"rating": "up"/"down", "q": ..., "a": ...}]}
+
+
 def _feedback_key(doc_name: str) -> str:
     return f"rag:feedback:{doc_name}"
 
 
 def _save_feedback(doc_name: str, question: str, answer: str, rating: str) -> None:
-    """Store one thumbs-up/down record. Redis list, 30-day TTL."""
+    """Store one thumbs-up/down record. Redis list when available, else in-memory."""
+    entry_dict = {
+        "q": question[:120],
+        "a": answer[:120],
+        "rating": rating,
+        "ts": datetime.now().isoformat(),
+    }
     client = _get_redis()
     if client and doc_name:
         try:
-            entry = json.dumps({
-                "q": question[:120],
-                "a": answer[:120],
-                "rating": rating,
-                "ts": datetime.now().isoformat(),
-            })
             key = _feedback_key(doc_name)
-            client.rpush(key, entry)
+            client.rpush(key, json.dumps(entry_dict))
             client.expire(key, 60 * 60 * 24 * 30)
+            return
         except Exception:
             pass
+    # In-memory fallback
+    if doc_name:
+        _feedback_mem.setdefault(doc_name, []).append(entry_dict)
 
 
 def _get_feedback_stats(doc_name: str) -> dict:
+    if not doc_name:
+        return {"total": 0, "up": 0, "down": 0, "rate": None}
+
     client = _get_redis()
-    if not client or not doc_name:
-        return {"total": 0, "up": 0, "down": 0, "rate": None}
-    try:
-        entries = client.lrange(_feedback_key(doc_name), 0, -1)
-        total = len(entries)
-        up = sum(1 for e in entries if json.loads(e).get("rating") == "up")
-        return {
-            "total": total,
-            "up": up,
-            "down": total - up,
-            "rate": round(up / total * 100, 1) if total else None,
-        }
-    except Exception:
-        return {"total": 0, "up": 0, "down": 0, "rate": None}
+    if client:
+        try:
+            entries = [json.loads(e) for e in client.lrange(_feedback_key(doc_name), 0, -1)]
+        except Exception:
+            entries = _feedback_mem.get(doc_name, [])
+    else:
+        entries = _feedback_mem.get(doc_name, [])
+
+    total = len(entries)
+    up = sum(1 for e in entries if e.get("rating") == "up")
+    return {
+        "total": total,
+        "up": up,
+        "down": total - up,
+        "rate": round(up / total * 100, 1) if total else None,
+    }
 
 
 def strip_emojis(text):
