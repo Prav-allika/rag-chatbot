@@ -18,6 +18,7 @@ from app.rag_pipeline import (
 # ---------- Redis conversation history ----------
 _redis_client = None
 _HISTORY_TTL = 60 * 60 * 24 * 7   # 7 days
+_history_mem: dict = {}            # in-memory fallback when Redis unavailable
 
 
 def _get_redis():
@@ -42,8 +43,11 @@ def _save_history(doc_name: str, history_text: str) -> None:
     if client and doc_name:
         try:
             client.setex(_history_key(doc_name), _HISTORY_TTL, history_text)
+            return
         except Exception:
             pass
+    if doc_name:
+        _history_mem[doc_name] = history_text
 
 
 def _load_history(doc_name: str) -> str:
@@ -53,7 +57,7 @@ def _load_history(doc_name: str) -> str:
             return client.get(_history_key(doc_name)) or ""
         except Exception:
             pass
-    return ""
+    return _history_mem.get(doc_name, "")
 
 
 def _delete_history(doc_name: str) -> None:
@@ -63,6 +67,7 @@ def _delete_history(doc_name: str) -> None:
             client.delete(_history_key(doc_name))
         except Exception:
             pass
+    _history_mem.pop(doc_name, None)
 
 
 # ---------- Phase 3 — Human Feedback (Redis-backed + in-memory fallback) ----------
@@ -771,7 +776,22 @@ button.stop:hover {
 }
 
 /* ── Dropdown ── */
-.wrap-inner { background: #FFFFFF !important; border-color: #FFD3AC !important; }
+.wrap-inner {
+    background: #FFFFFF !important;
+    border-color: #FFD3AC !important;
+    color: #3D1A06 !important;
+}
+/* Selected value text — covers all Gradio 5 dropdown internals */
+.wrap-inner *, .wrap-inner input, .wrap-inner span,
+.wrap-inner .value, .wrap-inner .token,
+.multiselect span, .multiselect input,
+.svelte-select span, .svelte-select input {
+    color: #3D1A06 !important;
+    background: transparent !important;
+}
+.wrap-inner input::placeholder {
+    color: #C8A080 !important;
+}
 .options { background: #FFFAF5 !important; border-color: #FFD3AC !important; }
 li.item { color: #3D1A06 !important; }
 li.item:hover, li.item.active {
