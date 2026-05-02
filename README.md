@@ -1,3 +1,13 @@
+---
+title: Rag Chatbot
+colorFrom: orange
+colorTo: yellow
+sdk: gradio
+sdk_version: 6.0.0
+app_file: app.py
+pinned: false
+---
+
 # RAG Chatbot — Chat with Any Document
 
 A production-grade Retrieval-Augmented Generation chatbot. Upload any document and ask questions about it. Built with LangChain, Groq LLaMA 3, FAISS, Qdrant, and Gradio.
@@ -236,5 +246,5 @@ All settings are in `env.example`. Key knobs:
 
 ## Author
 
-**Pravalli** — ML Engineer  
+**Pravalli** — AIML Engineer  
 [GitHub](https://github.com/Prav-allika) · [HuggingFace](https://huggingface.co/Prav04)
