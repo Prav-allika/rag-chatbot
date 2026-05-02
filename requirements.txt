@@ -36,7 +36,7 @@ pdf2image>=1.16.0     # PDF → image for OCR
 Pillow>=9.0.0         # Image handling for OCR
 
 # Gradio UI
-gradio>=4.0.0
+gradio>=4.0.0,<6.0.0
 
 # Hybrid retrieval
 rank-bm25>=0.2.2
