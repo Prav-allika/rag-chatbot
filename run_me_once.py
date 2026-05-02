@@ -25,14 +25,16 @@ logger = logging.getLogger(__name__)
 def parse_arguments():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Build FAISS vector store from PDF documents"
+        description="Build FAISS vector store from a document (PDF, DOCX, HTML, TXT, MD)"
     )
 
     parser.add_argument(
-        "--pdf",
+        "--file",
+        "--pdf",          # keep --pdf as a backward-compatible alias
+        dest="pdf",
         type=str,
         default="data/Attention.pdf",
-        help="Path to PDF file (default: data/Attention.pdf)",
+        help="Path to document file — PDF, DOCX, HTML, TXT, or MD (default: data/Attention.pdf)",
     )
 
     parser.add_argument(
@@ -55,26 +57,22 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def validate_pdf_path(pdf_path: str) -> None:
-    """
-    Validate that PDF file exists.
+def validate_file_path(pdf_path: str) -> None:
+    """Validate that the document file exists and is a supported type."""
+    from app.rag_pipeline import _SUPPORTED_EXTENSIONS
 
-    Args:
-        pdf_path: Path to PDF file
-
-    Raises:
-        FileNotFoundError: If PDF doesn't exist
-        ValueError: If file is not a PDF
-    """
     if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        raise FileNotFoundError(f"File not found: {pdf_path}")
 
-    if not pdf_path.lower().endswith(".pdf"):
-        raise ValueError(f"File must be a PDF: {pdf_path}")
+    ext = Path(pdf_path).suffix.lower()
+    if ext not in _SUPPORTED_EXTENSIONS:
+        supported = ", ".join(sorted(_SUPPORTED_EXTENSIONS))
+        raise ValueError(
+            f"Unsupported file type '{ext}'. Supported: {supported}"
+        )
 
-    # Check if file is readable
     if not os.access(pdf_path, os.R_OK):
-        raise PermissionError(f"Cannot read PDF file: {pdf_path}")
+        raise PermissionError(f"Cannot read file: {pdf_path}")
 
 
 def main():
@@ -100,11 +98,11 @@ def main():
 
         sys.exit(0)
 
-    # Validate PDF path
+    # Validate file path
     try:
-        logger.info(f"📄 PDF Path: {args.pdf}")
-        validate_pdf_path(args.pdf)
-        logger.info(" PDF file validated")
+        logger.info(f"Document Path: {args.pdf}")
+        validate_file_path(args.pdf)
+        logger.info("File validated")
     except (FileNotFoundError, ValueError, PermissionError) as e:
         logger.error(f" {e}")
         sys.exit(1)
@@ -131,7 +129,7 @@ def main():
         logger.info("🚀 Starting vector store creation...")
         logger.info("=" * 60)
 
-        build_vector_store(args.pdf, args.output)
+        build_vector_store(args.pdf, args.output, doc_id=os.path.basename(args.pdf))
 
         logger.info("=" * 60)
         logger.info(" Vector store created successfully!")
