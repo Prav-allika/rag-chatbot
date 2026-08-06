@@ -17,6 +17,7 @@ No dependency on the QA chain or LLM.
 
 import os
 import re
+import json
 import hashlib
 import logging
 import unicodedata
@@ -291,6 +292,66 @@ def _deduplicate_chunks(chunks: list) -> list:
 
 
 # =============================================================================
+# CONTEXTUAL RETRIEVAL  (Anthropic technique)
+# =============================================================================
+_CONTEXT_PROMPT = """<document>
+{doc}
+</document>
+Here is a chunk from the document above:
+<chunk>
+{chunk}
+</chunk>
+Write a short, 1-2 sentence context that situates this chunk within the overall document, to improve search retrieval of the chunk. Answer only with the succinct context, nothing else."""
+
+
+def _contextualize_chunks(chunks: list, full_text: str) -> list:
+    """
+    Prepend an LLM-generated situating sentence to each chunk before it is
+    embedded/BM25-indexed, so retrieval isn't blind to where a chunk sits in
+    the document. Reduces retrieval misses on chunks that read as ambiguous
+    in isolation (e.g. "the model achieved 92% accuracy" with no subject).
+
+    Original chunk text is preserved in metadata["original_content"] for
+    citation display. Runs one LLM call per chunk, parallelized.
+
+    No-ops (returns chunks unchanged) if disabled, or no fast LLM is
+    configured (skipped for the local FLAN-T5 fallback — too slow/weak
+    for this instruction-following task).
+    """
+    if not chunks or not Config.CONTEXTUAL_RETRIEVAL:
+        return chunks
+    if not (Config.use_openai() or Config.use_groq()):
+        logger.info("Contextual retrieval skipped — no Groq/OpenAI LLM configured")
+        return chunks
+
+    from app.rag_pipeline import get_llm
+    from langchain_core.prompts import PromptTemplate
+    from langchain_core.output_parsers import StrOutputParser
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    doc_excerpt = full_text[: Config.CONTEXTUAL_RETRIEVAL_MAX_DOC_CHARS]
+    prompt = PromptTemplate(template=_CONTEXT_PROMPT, input_variables=["doc", "chunk"])
+    chain = prompt | get_llm() | StrOutputParser()
+
+    def _add_context(chunk):
+        try:
+            context = chain.invoke({"doc": doc_excerpt, "chunk": chunk.page_content}).strip()
+            chunk.metadata["original_content"] = chunk.page_content
+            chunk.page_content = f"{context}\n\n{chunk.page_content}"
+        except Exception as e:
+            logger.warning(f"Contextual retrieval failed for a chunk: {e}")
+        return chunk
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = [pool.submit(_add_context, c) for c in chunks]
+        for f in as_completed(futures):
+            f.result()
+
+    logger.info(f"Contextual retrieval: added context to {len(chunks)} chunk(s)")
+    return chunks
+
+
+# =============================================================================
 # MULTI-FORMAT DOCUMENT LOADER
 # =============================================================================
 def load_document(file_path: str) -> list:
@@ -458,6 +519,58 @@ def _load_qdrant(doc_id: str, embeddings):
 
 
 # =============================================================================
+# EMBED CACHE  (skip re-embedding a document that hasn't changed)
+# =============================================================================
+_MANIFEST_PATH = "artifacts/vector_store/manifest.json"
+
+
+def _file_hash(file_path: str) -> str:
+    """MD5 of the file's bytes — detects whether the document content changed."""
+    h = hashlib.md5()
+    with open(file_path, "rb") as f:
+        h.update(f.read())
+    return h.hexdigest()
+
+
+def _embed_fingerprint() -> dict:
+    """Config knobs that change what gets embedded — cache must invalidate if any change."""
+    return {
+        "embedding_model": Config.OPENAI_EMBEDDING_MODEL if Config.use_openai() else Config.EMBEDDING_MODEL,
+        "chunk_size": Config.CHUNK_SIZE,
+        "chunk_overlap": Config.CHUNK_OVERLAP,
+        "contextual_retrieval": Config.CONTEXTUAL_RETRIEVAL,
+    }
+
+
+def _load_manifest() -> dict:
+    if os.path.exists(_MANIFEST_PATH):
+        try:
+            with open(_MANIFEST_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_manifest(manifest: dict) -> None:
+    os.makedirs(os.path.dirname(_MANIFEST_PATH), exist_ok=True)
+    with open(_MANIFEST_PATH, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def _existing_store_available(doc_id: str, store_path: str) -> bool:
+    """True if a vector store for doc_id already exists on the currently active backend."""
+    if bool(Config.QDRANT_URL) and _has_internet():
+        try:
+            from qdrant_client import QdrantClient
+            client = QdrantClient(url=Config.QDRANT_URL, api_key=Config.QDRANT_API_KEY)
+            return client.collection_exists(_qdrant_collection(doc_id))
+        except Exception:
+            return False
+    return os.path.exists(store_path)
+
+
+# =============================================================================
 # VECTOR STORE — BUILD + LOAD
 # =============================================================================
 def build_vector_store(file_path: str, store_path: str, doc_id: str = "default"):
@@ -468,6 +581,11 @@ def build_vector_store(file_path: str, store_path: str, doc_id: str = "default")
       Qdrant Cloud  — when QDRANT_URL is set in .env AND internet is reachable
       FAISS (local) — fallback (offline, no config needed)
 
+    Skips re-embedding entirely if this exact doc_id was already embedded with
+    the same file content AND the same embedding-relevant config (see
+    _embed_fingerprint) — re-uploading an unchanged file, or restarting the
+    app, doesn't burn embedding/contextual-retrieval tokens again.
+
     Returns (vector_store, all_chunks).
     all_chunks is passed to make_qa_chain() so BM25 works regardless of backend.
     """
@@ -476,6 +594,12 @@ def build_vector_store(file_path: str, store_path: str, doc_id: str = "default")
 
     try:
         from app.rag_pipeline import get_embeddings   # lazy import — avoids circular
+
+        fingerprint = {"file_hash": _file_hash(file_path), **_embed_fingerprint()}
+        manifest = _load_manifest()
+        if manifest.get(doc_id) == fingerprint and _existing_store_available(doc_id, store_path):
+            logger.info(f"'{doc_id}' unchanged (same content + embedding config) — reusing existing vector store")
+            return load_vector_store(store_path, doc_id=doc_id)
 
         docs = load_document(file_path)
         if not docs:
@@ -492,12 +616,15 @@ def build_vector_store(file_path: str, store_path: str, doc_id: str = "default")
         chunks = _deduplicate_chunks(chunks)
         logger.info(f"Created {len(chunks)} chunks after deduplication")
 
+        full_text = "\n\n".join(d.page_content for d in docs)
+        chunks = _contextualize_chunks(chunks, full_text)
+
         embeddings = get_embeddings()
 
         use_qdrant = bool(Config.QDRANT_URL) and _has_internet()
         if use_qdrant:
             logger.info("Backend: Qdrant Cloud (internet available)")
-            return _build_qdrant(chunks, embeddings, doc_id)
+            result = _build_qdrant(chunks, embeddings, doc_id)
         else:
             reason = "QDRANT_URL not set" if not Config.QDRANT_URL else "no internet"
             logger.info(f"Backend: FAISS local ({reason})")
@@ -505,7 +632,11 @@ def build_vector_store(file_path: str, store_path: str, doc_id: str = "default")
             os.makedirs(os.path.dirname(store_path), exist_ok=True)
             vector_store.save_local(store_path)
             logger.info(f"FAISS index saved: {store_path}")
-            return vector_store, chunks
+            result = vector_store, chunks
+
+        manifest[doc_id] = fingerprint
+        _save_manifest(manifest)
+        return result
 
     except Exception as e:
         logger.error(f"Failed to build vector store: {e}")

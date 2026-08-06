@@ -31,10 +31,12 @@ class Config:
     LLM_MODEL: str       = os.getenv("LLM_MODEL", "google/flan-t5-base")
     LLM_MAX_LENGTH: int  = int(os.getenv("LLM_MAX_LENGTH", 512))
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", 0.7))
+    LLM_MAX_OUTPUT_TOKENS: int = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", 800))
 
     # --- OpenAI (optional) ---
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     OPENAI_MODEL: str   = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+    OPENAI_EMBEDDING_MODEL: str = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
 
     # --- Groq (recommended) ---
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
@@ -52,6 +54,12 @@ class Config:
     DECOMPOSE_QUERIES: bool  = os.getenv("DECOMPOSE_QUERIES", "true").lower() == "true"
     HYDE_ENABLED: bool       = os.getenv("HYDE_ENABLED", "false").lower() == "true"
     HISTORY_TURNS: int       = int(os.getenv("HISTORY_TURNS", "2"))
+
+    # --- Contextual Retrieval (Anthropic technique) ---
+    CONTEXTUAL_RETRIEVAL: bool = os.getenv("CONTEXTUAL_RETRIEVAL", "false").lower() == "true"
+    CONTEXTUAL_RETRIEVAL_MAX_DOC_CHARS: int = int(
+        os.getenv("CONTEXTUAL_RETRIEVAL_MAX_DOC_CHARS", "30000")
+    )
 
     # --- Semantic cache ---
     SEMANTIC_CACHE_THRESHOLD: float = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92"))

@@ -1,11 +1,25 @@
-import gradio as gr
-import os
-import re
-import json
-import time
-import tempfile
-from datetime import datetime
-from app.rag_pipeline import (
+
+import logging
+
+# Configured before any other import so INFO logs emitted at import time
+# (e.g. rag_pipeline's LangSmith setup log) aren't silently dropped, and
+# force=True wins even if a dependency (transformers/huggingface_hub/etc.)
+# already called basicConfig() as a side effect, which would otherwise make
+# this a no-op and leave log level/format inconsistent across modules.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    force=True,
+)
+
+import gradio as gr  # noqa: E402
+import os  # noqa: E402
+import re  # noqa: E402
+import json  # noqa: E402
+import time  # noqa: E402
+import tempfile  # noqa: E402
+from datetime import datetime  # noqa: E402
+from app.rag_pipeline import (  # noqa: E402
     build_vector_store,
     make_qa_chain,
     check_input_guard,
@@ -321,14 +335,30 @@ def ask_question(question, history_text):
 
         # Phase 3 — append latency breakdown to sources panel
         t_end = time.time()
-        retrieval_ms = int((t_retrieval_done - t_start) * 1000) if t_retrieval_done else 0
         total_ms = int((t_end - t_start) * 1000)
-        generation_ms = total_ms - retrieval_ms
-        sources_text += (
-            f"\n\n{'- ' * 25}\n"
-            f"Latency — Retrieval+Rerank: {retrieval_ms}ms  |  "
-            f"Generation: {generation_ms}ms  |  Total: {total_ms}ms"
-        )
+
+        if cache_hit:
+            # Semantic cache hit — served without a new LLM call, so TTFT/tokens/sec
+            # don't apply. Say so explicitly instead of showing misleading zeros.
+            sources_text += (
+                f"\n\n{'- ' * 25}\n"
+                f"Latency — Served from semantic cache: {total_ms}ms (no new generation)"
+            )
+        else:
+            ttft_ms = int((t_retrieval_done - t_start) * 1000) if t_retrieval_done else 0
+            generation_ms = total_ms - ttft_ms
+
+            generated_tokens = (final_update or {}).get("generated_tokens", 0)
+            cached_tokens = (final_update or {}).get("cached_tokens", 0)
+            tokens_per_sec = round(generated_tokens / (generation_ms / 1000), 1) if generation_ms > 0 and generated_tokens else 0.0
+            cache_str = f"  |  Prompt cache: {cached_tokens} tok" if cached_tokens else ""
+
+            sources_text += (
+                f"\n\n{'- ' * 25}\n"
+                f"Latency — TTFT (incl. retrieval+rerank): {ttft_ms}ms  |  "
+                f"Generation: {generation_ms}ms  |  Total: {total_ms}ms\n"
+                f"{tokens_per_sec} tok/s  |  {generated_tokens} tokens generated{cache_str}"
+            )
 
     except Exception as e:
         answer = f"Error: {str(e)}"
@@ -842,8 +872,6 @@ hr {
 # ================================================================
 with gr.Blocks(
     title="RAG Chatbot — Chat with Any Document",
-    theme=_THEME,
-    css=_CSS,
 ) as demo:
 
     # ── Header ──────────────────────────────────────────────────
@@ -1042,4 +1070,4 @@ with gr.Blocks(
 
 if __name__ == "__main__":
     demo.queue()
-    demo.launch()
+    demo.launch(theme=_THEME, css=_CSS)

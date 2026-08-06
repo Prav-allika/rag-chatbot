@@ -11,6 +11,9 @@ langchain-text-splitters>=0.0.1
 # LLM Providers (install whichever you use)
 langchain-groq>=0.1.0          # Groq — fast, recommended
 langchain-openai>=0.0.5        # OpenAI — optional
+groq>=0.9.0                    # native client — used directly for RAGAS judging
+openai>=1.0.0                  # native client — used directly for RAGAS judging
+tiktoken>=0.7.0                # token counting for the latency panel (tokens/sec)
 
 # Machine Learning & NLP
 sentence-transformers>=2.6.0
@@ -36,7 +39,7 @@ pdf2image>=1.16.0     # PDF → image for OCR
 Pillow>=9.0.0         # Image handling for OCR
 
 # Gradio UI
-gradio>=4.0.0,<6.0.0
+gradio>=6.0.0,<7.0.0
 
 # Hybrid retrieval
 rank-bm25>=0.2.2
@@ -48,7 +51,9 @@ redis>=4.0.0
 python-dotenv>=1.0.0
 
 # Evaluation (RAGAS — set RAGAS_EVAL=true in .env to enable)
-ragas>=0.1.0
+# Our RAGAS integration (app/evaluation.py) targets the 0.4.x "collections" API
+# (llm_factory/embedding_factory + native async clients) — ragas <0.4 lacks it.
+ragas>=0.4.0
 datasets>=2.14.0
 
 # Observability (LangSmith — set LANGCHAIN_TRACING_V2=true and LANGCHAIN_API_KEY in .env)

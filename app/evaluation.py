@@ -13,7 +13,9 @@ Neither function is called in the production answer path.
 Enable RAGAS with RAGAS_EVAL=true in .env.
 """
 
+import json
 import logging
+import os
 import random
 
 from langchain_core.prompts import PromptTemplate
@@ -71,6 +73,28 @@ def generate_retrieval_test_set(chunks: list, n_questions: int = 10) -> list:
     return test_set
 
 
+def save_test_set(test_set: list, path: str) -> None:
+    """
+    Persist a generated test set to JSON so it can be reused across configs.
+
+    generate_retrieval_test_set() randomly samples chunks and has the LLM
+    write fresh questions every call — comparing two configs against two
+    independently-generated test sets confounds "config changed" with
+    "questions changed". Generate once, save, then reuse for every config
+    you want to compare.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(test_set, f, indent=2)
+    logger.info(f"Test set saved: {len(test_set)} question(s) -> {path}")
+
+
+def load_test_set(path: str) -> list:
+    """Load a test set previously written by save_test_set()."""
+    with open(path) as f:
+        return json.load(f)
+
+
 def evaluate_retrieval_metrics(retrieve_fn, test_set: list, k: int = 3) -> dict:
     """
     Compute retrieval quality metrics against a synthetic test set.
@@ -125,6 +149,37 @@ def evaluate_retrieval_metrics(retrieve_fn, test_set: list, k: int = 3) -> dict:
     }
 
 
+def _ragas_llm():
+    """
+    Native ragas LLM (InstructorBaseRagasLLM) for the app's configured provider.
+    ragas 0.4.x's `metrics.collections` API requires this — it rejects the
+    LangChain wrapper (LangchainLLMWrapper) used by older ragas versions.
+    """
+    from ragas.llms import llm_factory
+
+    if Config.use_groq():
+        from groq import AsyncGroq
+        return llm_factory(Config.GROQ_MODEL, provider="groq", client=AsyncGroq(api_key=Config.GROQ_API_KEY))
+    from openai import AsyncOpenAI
+    return llm_factory(Config.OPENAI_MODEL, provider="openai", client=AsyncOpenAI(api_key=Config.OPENAI_API_KEY))
+
+
+def _ragas_embeddings():
+    """
+    Native ragas embeddings for AnswerRelevancy. Only available when OpenAI is
+    configured — our app has no other embeddings provider wired up.
+    """
+    if not Config.use_openai():
+        return None
+    from ragas.embeddings.base import embedding_factory
+    from openai import AsyncOpenAI
+    return embedding_factory(
+        provider="openai",
+        model=Config.OPENAI_EMBEDDING_MODEL,
+        client=AsyncOpenAI(api_key=Config.OPENAI_API_KEY),
+    )
+
+
 # =============================================================================
 # PHASE 2 — RAGAS GENERATION EVALUATION
 # =============================================================================
@@ -134,11 +189,12 @@ def evaluate_rag_response(question: str, answer: str, contexts: list) -> dict:
 
     Metrics:
       Faithfulness               — every claim is supported by retrieved chunks
-      Answer Relevancy           — answer addresses the question asked
+      Answer Relevancy           — answer addresses the question asked (skipped
+                                    if OpenAI isn't configured — no embeddings provider)
       Context Precision          — retrieved chunks are relevant and well-ranked
 
     Scores: 0.0 (poor) → 1.0 (perfect).
-    Uses the same Groq LLM + HuggingFace embeddings already loaded.
+    Uses the same LLM configured for the app (Groq or OpenAI).
     Requires RAGAS_EVAL=true in .env.
     """
     if not Config.RAGAS_EVAL:
@@ -146,57 +202,57 @@ def evaluate_rag_response(question: str, answer: str, contexts: list) -> dict:
     if not answer.strip() or not contexts:
         return {"error": "No answer or contexts available to evaluate"}
 
+    import asyncio
+
+    # RAGAS 0.4.x "collections" API — native provider clients, async ascore()
     try:
-        from ragas.llms import LangchainLLMWrapper
-        from ragas.embeddings import LangchainEmbeddingsWrapper
-    except ImportError:
-        return {"error": "Run: pip install ragas datasets"}
-
-    from app.rag_pipeline import get_llm, get_embeddings
-
-    llm_w = LangchainLLMWrapper(get_llm())
-    emb_w = LangchainEmbeddingsWrapper(get_embeddings())
-
-    # RAGAS 0.2+ / 0.4.x API
-    try:
-        from ragas import EvaluationDataset, SingleTurnSample
-        from ragas import evaluate as _ragas_eval
         from ragas.metrics.collections import (
             Faithfulness,
             AnswerRelevancy,
             ContextPrecisionWithoutReference,
         )
 
-        sample = SingleTurnSample(
-            user_input=question,
-            response=answer,
-            retrieved_contexts=contexts,
-        )
-        result = _ragas_eval(
-            dataset=EvaluationDataset(samples=[sample]),
-            metrics=[
-                Faithfulness(llm=llm_w),
-                AnswerRelevancy(llm=llm_w, embeddings=emb_w),
-                ContextPrecisionWithoutReference(llm=llm_w),
-            ],
-        )
-        scores = {}
-        for k, v in result.items():
-            try:
-                scores[k] = round(float(v), 3)
-            except (TypeError, ValueError):
-                pass
-        return scores
+        llm = _ragas_llm()
+        embeddings = _ragas_embeddings()
 
-    except (ImportError, AttributeError):
-        pass
+        async def _run():
+            scores = {}
+            f = await Faithfulness(llm=llm).ascore(
+                user_input=question, response=answer, retrieved_contexts=contexts
+            )
+            scores["faithfulness"] = f.value
 
-    # RAGAS 0.1.x fallback
+            p = await ContextPrecisionWithoutReference(llm=llm).ascore(
+                user_input=question, response=answer, retrieved_contexts=contexts
+            )
+            scores["context_precision"] = p.value
+
+            if embeddings is not None:
+                r = await AnswerRelevancy(llm=llm, embeddings=embeddings).ascore(
+                    user_input=question, response=answer
+                )
+                scores["answer_relevancy"] = r.value
+            return scores
+
+        scores = asyncio.run(_run())
+        return {k: round(float(v), 3) for k, v in scores.items()}
+
+    except ImportError:
+        return {"error": "Run: pip install ragas datasets"}
+    except AttributeError:
+        pass  # collections API unavailable on this ragas version — fall through
+
+    # RAGAS 0.1.x fallback (LangChain-wrapper API, older ragas versions)
     try:
+        from app.rag_pipeline import get_llm, get_embeddings
+        from ragas.llms import LangchainLLMWrapper
+        from ragas.embeddings import LangchainEmbeddingsWrapper
         from ragas import evaluate as _ragas_eval
         from ragas.metrics import faithfulness, answer_relevancy, context_precision
         from datasets import Dataset
 
+        llm_w = LangchainLLMWrapper(get_llm())
+        emb_w = LangchainEmbeddingsWrapper(get_embeddings())
         faithfulness.llm = llm_w
         answer_relevancy.llm = llm_w
         answer_relevancy.embeddings = emb_w

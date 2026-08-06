@@ -79,14 +79,14 @@ Context:
 Question: {question}
 Answer:""",
 
-    "CONCEPTUAL": """Explain using ONLY the document context provided below.
+    "CONCEPTUAL": """Explain the concept below using the document context provided.
 STRICT RULES — violating any of these is an error:
-  1. Do NOT use your general knowledge or training data.
+  1. Every fact, claim, or number about the document's subject matter must come from the context below — do NOT use general knowledge to explain what the document itself says or claims.
   2. Do NOT fabricate connections between the question and unrelated content.
-  3. Do NOT speculate or infer beyond what the context explicitly states.
-  4. If the concept is not explained in the context, respond with exactly:
+  3. If the concept is not explained in the context, respond with exactly:
      "This question is not covered in the loaded document. Please ask something about the document content."
-  5. After each sentence drawn from the context, place a superscript number at the end of the sentence (e.g. ¹ for Source 1, ² for Source 2, ³ for Source 3). No brackets, no "Source" word — just the tiny number. Example: "Random forests outperform single decision trees on most benchmarks.¹"
+  4. After each sentence drawn from the context, place a superscript number at the end of the sentence (e.g. ¹ for Source 1, ² for Source 2, ³ for Source 3). No brackets, no "Source" word — just the tiny number. Example: "Random forests outperform single decision trees on most benchmarks.¹"
+  5. You MAY add ONE short original real-life analogy or example of your own to aid understanding, even if it is not in the context — but only if it does not contradict the context. Put it on its own line starting with "Analogy:" and do NOT put a citation number on it, since it did not come from the document.
 {history_section}
 Context:
 {context}
@@ -309,9 +309,12 @@ def get_embeddings():
     """Return embeddings model (cached)."""
     try:
         if Config.use_openai():
-            logger.info("Using OpenAI Embeddings")
+            logger.info(f"Using OpenAI Embeddings: {Config.OPENAI_EMBEDDING_MODEL}")
             from langchain_openai import OpenAIEmbeddings
-            return OpenAIEmbeddings(openai_api_key=Config.OPENAI_API_KEY)
+            return OpenAIEmbeddings(
+                model=Config.OPENAI_EMBEDDING_MODEL,
+                openai_api_key=Config.OPENAI_API_KEY,
+            )
         else:
             logger.info(f"Using HuggingFace Embeddings: {Config.EMBEDDING_MODEL}")
             return HuggingFaceEmbeddings(
@@ -335,15 +338,29 @@ def get_llm():
                 model=Config.GROQ_MODEL,
                 groq_api_key=Config.GROQ_API_KEY,
                 temperature=Config.LLM_TEMPERATURE,
+                max_tokens=Config.LLM_MAX_OUTPUT_TOKENS,
             )
         elif Config.use_openai():
             logger.info(f"Using OpenAI: {Config.OPENAI_MODEL}")
             from langchain_openai import ChatOpenAI
-            return ChatOpenAI(
-                model=Config.OPENAI_MODEL,
-                openai_api_key=Config.OPENAI_API_KEY,
-                temperature=Config.LLM_TEMPERATURE,
-            )
+            # gpt-5.x models reject `temperature` (reasoning models use
+            # reasoning_effort/verbosity instead) — only pass it for older models.
+            # They also spend max_tokens on hidden reasoning tokens before any
+            # visible output — verified empirically: max_tokens=50 with no
+            # reasoning_effort set burned all 50 on reasoning and returned "".
+            # reasoning_effort="minimal" avoids that (0 reasoning tokens in testing)
+            # and is itself a real cost cut, since reasoning tokens bill as output.
+            kwargs = {
+                "model": Config.OPENAI_MODEL,
+                "openai_api_key": Config.OPENAI_API_KEY,
+                "max_tokens": Config.LLM_MAX_OUTPUT_TOKENS,
+                "stream_usage": True,   # required for usage/cache-hit data on streamed chunks
+            }
+            if Config.OPENAI_MODEL.startswith("gpt-5"):
+                kwargs["reasoning_effort"] = "minimal"
+            else:
+                kwargs["temperature"] = Config.LLM_TEMPERATURE
+            return ChatOpenAI(**kwargs)
         else:
             logger.info(f"Using HuggingFace LLM: {Config.LLM_MODEL}")
             from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -372,6 +389,39 @@ def get_llm():
     except Exception as e:
         logger.error(f"Failed to load LLM: {e}")
         raise RuntimeError(f"LLM initialization failed: {e}")
+
+
+_token_encoding = None
+
+
+def _count_tokens(text: str) -> int:
+    """
+    Token count via tiktoken's cl100k_base encoding.
+    Exact for OpenAI models; a reasonable order-of-magnitude approximation for
+    Groq/local models, which use different tokenizers — fine for a latency
+    panel's tokens/sec display, not for billing.
+    """
+    global _token_encoding
+    if _token_encoding is None:
+        import tiktoken
+        _token_encoding = tiktoken.get_encoding("cl100k_base")
+    return len(_token_encoding.encode(text))
+
+
+def _extract_text(chunk) -> str:
+    """Chat models (Groq/OpenAI) stream AIMessageChunk; the local FLAN-T5 fallback streams plain strings."""
+    return chunk.content if hasattr(chunk, "content") else chunk
+
+
+def _extract_cached_tokens(message) -> int:
+    """
+    OpenAI's automatic prompt-cache hit count for this call (0 if no hit, not
+    supported by this backend, or not a chat-model message at all).
+    """
+    try:
+        return message.usage_metadata["input_token_details"]["cache_read"]
+    except (AttributeError, KeyError, TypeError):
+        return 0
 
 
 @lru_cache(maxsize=1)
@@ -574,7 +624,9 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                 template=template,
                 input_variables=["context", "question", "history_section"],
             )
-            answer_chains[qtype] = prompt | get_llm() | StrOutputParser()
+            # No StrOutputParser — invoke()/stream() need the raw AIMessage(Chunk)
+            # to read token usage and OpenAI's prompt-cache hit count off it.
+            answer_chains[qtype] = prompt | get_llm()
 
         # Per-document persistent cache (Redis when available, memory fallback)
         cache = PersistentSemanticCache(
@@ -696,14 +748,15 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                 history_section = _parse_recent_history(
                     inputs.get("history", ""), Config.HISTORY_TURNS
                 )
-                result = self._answer_chains[query_type].invoke(
+                raw_result = self._answer_chains[query_type].invoke(
                     {"context": context, "question": standalone_q,
                      "history_section": history_section}
                 )
+                result = _extract_text(raw_result)
                 sources = [
                     {
                         "chunk": i + 1,
-                        "content": doc.page_content[:300],
+                        "content": doc.metadata.get("original_content", doc.page_content)[:300],
                         "page": doc.metadata.get("page", "N/A"),
                         "score": doc.metadata.get("rerank_score", "N/A"),
                         "method": doc.metadata.get("extract_method", ""),
@@ -716,6 +769,8 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                     "grade": grade,
                     "query_type": query_type,
                     "cache_hit": False,
+                    "generated_tokens": _count_tokens(result),
+                    "cached_tokens": _extract_cached_tokens(raw_result),
                 }
                 self._cache.store(question, {k: v for k, v in payload.items() if k != "cache_hit"})
                 return payload
@@ -779,7 +834,7 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                 sources = [
                     {
                         "chunk": i + 1,
-                        "content": doc.page_content[:300],
+                        "content": doc.metadata.get("original_content", doc.page_content)[:300],
                         "page": doc.metadata.get("page", "N/A"),
                         "score": doc.metadata.get("rerank_score", "N/A"),
                         "method": doc.metadata.get("extract_method", ""),
@@ -788,6 +843,7 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                 ]
                 answer_chain = self._answer_chains[query_type]
                 full_answer = ""
+                accumulated_msg = None   # merged AIMessageChunk — carries final usage metadata
                 chain_inputs = {
                     "context": context,
                     "question": standalone_q,
@@ -795,10 +851,13 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                 }
 
                 try:
-                    for chunk in answer_chain.stream(chain_inputs):
-                        full_answer += chunk
+                    for raw_chunk in answer_chain.stream(chain_inputs):
+                        text = _extract_text(raw_chunk)
+                        full_answer += text
+                        if hasattr(raw_chunk, "content"):
+                            accumulated_msg = raw_chunk if accumulated_msg is None else accumulated_msg + raw_chunk
                         yield {
-                            "chunk": chunk,
+                            "chunk": text,
                             "result": full_answer,
                             "sources": [],
                             "grade": grade,
@@ -808,7 +867,9 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                         }
                 except Exception:
                     # Fallback for models that don't support streaming
-                    full_answer = answer_chain.invoke(chain_inputs)
+                    raw_result = answer_chain.invoke(chain_inputs)
+                    full_answer = _extract_text(raw_result)
+                    accumulated_msg = raw_result if hasattr(raw_result, "content") else None
                     yield {
                         "chunk": full_answer,
                         "result": full_answer,
@@ -818,6 +879,9 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                         "cache_hit": False,
                         "done": False,
                     }
+
+                generated_tokens = _count_tokens(full_answer)
+                cached_tokens = _extract_cached_tokens(accumulated_msg)
 
                 self._cache.store(question, {
                     "result": full_answer,
@@ -834,6 +898,8 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                     "query_type": query_type,
                     "cache_hit": False,
                     "done": True,
+                    "generated_tokens": generated_tokens,
+                    "cached_tokens": cached_tokens,
                 }
 
             def run(self, question: str) -> str:
@@ -848,13 +914,17 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
             # ----------------------------------------------------------------
             # Phase 1 — Retrieval Evaluation
             # ----------------------------------------------------------------
-            def run_retrieval_eval(self, n_questions: int = 8, k: int = 3) -> dict:
+            def run_retrieval_eval(self, n_questions: int = 8, k: int = 3, test_set: list = None) -> dict:
                 """
-                Generate a synthetic test set from document chunks, then compute
-                Precision@K, Recall@K, MRR, and Coverage.
-                ~10-20 seconds for n_questions=8 (one LLM call per question).
+                Compute Precision@K, Recall@K, MRR, and Coverage.
+
+                Pass `test_set` (from evaluation.save_test_set/load_test_set) to
+                reuse a fixed question set across configs for a fair comparison.
+                Otherwise generates a fresh synthetic test set from document
+                chunks (~10-20 seconds for n_questions=8, one LLM call per question).
                 """
-                test_set = generate_retrieval_test_set(self._all_chunks, n_questions)
+                if test_set is None:
+                    test_set = generate_retrieval_test_set(self._all_chunks, n_questions)
                 if not test_set:
                     return {"error": "Could not generate test set from document chunks"}
                 return evaluate_retrieval_metrics(self._hybrid_retrieve, test_set, k)
