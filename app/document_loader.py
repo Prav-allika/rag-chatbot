@@ -9,6 +9,7 @@ Responsibilities:
         text page                         →  pdfplumber  plain text
   - Header/footer strip   : frequency-based, across pages
   - Encoding normalisation: NFKC + ligature/smart-quote fixes
+  - Chunking              : switchable strategies (see app/chunking.py)
   - Chunk deduplication   : MD5 hash dedup after splitting
   - Vector store          : build (embed + save) and load (FAISS)
 
@@ -24,15 +25,24 @@ import unicodedata
 from pathlib import Path
 from collections import Counter
 
+import numpy as np
+
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.config import Config
+from app import chunking
 
 logger = logging.getLogger(__name__)
 
 _SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".html", ".htm", ".txt", ".md"}
+
+# pdfplumber's default x_tolerance (3) infers word boundaries from character
+# gaps and fuses adjacent words together on PDFs with tight kerning (observed
+# on this LaTeX-generated arXiv PDF: "Table1: Maximumpathlengths..." instead of
+# "Table 1: Maximum path lengths..."). A lower tolerance fixes it without
+# affecting normally-spaced PDFs. Verified against this document's actual pages.
+_PDF_TEXT_X_TOLERANCE = 1.5
 
 
 # =============================================================================
@@ -133,7 +143,7 @@ def _classify_page(page) -> str:
       'table'   — has structured tables (may also have prose)    → pdfplumber table mode
       'text'    — normal searchable text, no tables              → pdfplumber plain text
     """
-    text = page.extract_text() or ""
+    text = page.extract_text(x_tolerance=_PDF_TEXT_X_TOLERANCE) or ""
     word_count = len(text.split())
     has_tables = bool(page.find_tables())
     has_images = bool(getattr(page, "images", []))
@@ -143,6 +153,48 @@ def _classify_page(page) -> str:
     if has_tables:
         return "table"
     return "text"
+
+
+_TABLE_CAPTION_RE = re.compile(r"^Table\s+\d+\s*:", re.IGNORECASE)
+_SECTION_HEADER_RE = re.compile(r"^\d{1,2}(\.\d{1,2}){0,3}\s+[A-Z]")
+
+
+def _wrap_informal_tables(text: str) -> str:
+    """
+    Some tables in this kind of PDF (e.g. Table 1 in the Attention paper) have
+    no visible ruling lines, so pdfplumber's find_tables() misses them and
+    they get extracted as plain prose -- nothing then stops the chunker from
+    splitting a row (or its caption) away from the rest of the table (observed
+    directly: a 4-row table truncated to 3 rows mid-chunk). Detects "Table N:"
+    caption lines and wraps that caption through to the next numbered-section
+    header (or the next table caption) in a "[TABLE]" block, so
+    app/chunking.py's atomic-table handling — which already looks for that
+    marker, for pdfplumber-detected tables — keeps it together too.
+    """
+    lines = text.split("\n")
+    out_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if _TABLE_CAPTION_RE.match(line.strip()):
+            block = [line]
+            i += 1
+            while i < len(lines):
+                stripped = lines[i].strip()
+                if _SECTION_HEADER_RE.match(stripped) or _TABLE_CAPTION_RE.match(stripped):
+                    break
+                block.append(lines[i])
+                i += 1
+            while block and not block[-1].strip():
+                block.pop()
+            out_lines.append("")
+            out_lines.append("[TABLE]")
+            out_lines.extend(block)
+            out_lines.append("")
+        else:
+            out_lines.append(line)
+            i += 1
+    return "\n".join(out_lines)
 
 
 def _pdfplumber_table_text(page) -> str:
@@ -164,14 +216,14 @@ def _pdfplumber_table_text(page) -> str:
                         obj.get("bottom", obj.get("top", 0)) <= bottom + 2):
                     return False
             return True
-        plain = page.filter(_not_in_table).extract_text() or ""
+        plain = page.filter(_not_in_table).extract_text(x_tolerance=_PDF_TEXT_X_TOLERANCE) or ""
     else:
-        plain = page.extract_text() or ""
+        plain = page.extract_text(x_tolerance=_PDF_TEXT_X_TOLERANCE) or ""
 
     if plain.strip():
         parts.append(plain.strip())
 
-    for table in page.extract_tables():
+    for table in page.extract_tables(table_settings={"text_x_tolerance": _PDF_TEXT_X_TOLERANCE}):
         if not table:
             continue
         rows = [
@@ -232,7 +284,7 @@ def _adaptive_pdf_extract(file_path: str):
                     content = _ocr_pdf_page(file_path, page_num)
                     if not content.strip():
                         # OCR not installed / failed → last-resort pdfplumber text
-                        content = page.extract_text() or ""
+                        content = page.extract_text(x_tolerance=_PDF_TEXT_X_TOLERANCE) or ""
                         method = "ocr_fallback"
 
                 elif page_type == "table":
@@ -244,13 +296,17 @@ def _adaptive_pdf_extract(file_path: str):
                         method = "ocr_fallback"
 
                 else:  # "text"
-                    content = page.extract_text() or ""
+                    content = page.extract_text(x_tolerance=_PDF_TEXT_X_TOLERANCE) or ""
                     # Upgrade: if pdfplumber got suspiciously little text, try OCR
                     if len(content.split()) < 20:
                         ocr = _ocr_pdf_page(file_path, page_num)
                         if len(ocr.split()) > len(content.split()):
                             content = ocr
                             method = "ocr_upgrade"
+                    if method == "text":
+                        # find_tables() missed this page (no ruling lines) but it
+                        # may still contain an unbordered "Table N:" style table.
+                        content = _wrap_informal_tables(content)
 
                 method_counts[method] = method_counts.get(method, 0) + 1
 
@@ -289,6 +345,45 @@ def _deduplicate_chunks(chunks: list) -> list:
     if removed:
         logger.info(f"Deduplication: removed {removed} duplicate chunk(s)")
     return unique
+
+
+def _deduplicate_near_duplicates(chunks: list, embeddings, threshold: float = 0.95) -> list:
+    """
+    Remove near-duplicate chunks (cosine similarity > threshold) that survive
+    exact-hash dedup — e.g. the same information paraphrased across two source
+    documents. Greedy: keeps a chunk unless it's too similar to one already kept.
+
+    Runs after _deduplicate_chunks (exact-hash pass is a cheap pre-filter) and
+    before contextual retrieval (must dedup on original chunk text, not the
+    LLM-prepended situating context).
+    """
+    if len(chunks) < 2:
+        return chunks
+
+    vectors = np.array(embeddings.embed_documents([c.page_content for c in chunks]), dtype=float)
+    vectors = np.nan_to_num(vectors, nan=0.0, posinf=0.0, neginf=0.0)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1e-8
+    unit = vectors / norms
+
+    kept_idx: list = []
+    for i in range(len(chunks)):
+        if kept_idx:
+            # np.errstate: BLAS matmul can transiently hit overflow/invalid on some
+            # platforms (observed with macOS Accelerate) with no actual bad input data
+            # (verified: raw embeddings here are always finite, normed ~1.0). Silence
+            # the warning and sanitize the output rather than the (already-clean) input.
+            with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+                sims = unit[kept_idx] @ unit[i]
+            sims = np.nan_to_num(sims, nan=0.0, posinf=1.0, neginf=-1.0)
+            if float(sims.max()) > threshold:
+                continue
+        kept_idx.append(i)
+
+    removed = len(chunks) - len(kept_idx)
+    if removed:
+        logger.info(f"Near-duplicate deduplication: removed {removed} chunk(s) (cosine similarity > {threshold})")
+    return [chunks[i] for i in kept_idx]
 
 
 # =============================================================================
@@ -532,13 +627,41 @@ def _file_hash(file_path: str) -> str:
     return h.hexdigest()
 
 
+_PIPELINE_SOURCE_FILES = ("document_loader.py", "chunking.py")
+
+
+def _pipeline_code_hash() -> str:
+    """
+    MD5 over the extraction/chunking source files themselves (not just config
+    knobs) — included in the embed fingerprint so a CODE change (a bug fix to
+    how text is extracted or split) forces a rebuild too, not only a config
+    change. Config knobs alone missed exactly this: the pdfplumber x_tolerance
+    fix and the atomic-table-chunking fix were both pure code changes with no
+    corresponding config field, so the old fingerprint never changed and a
+    stale, pre-fix store (word-fused text, truncated tables) kept getting
+    silently reused across rebuilds.
+    """
+    h = hashlib.md5()
+    this_dir = Path(__file__).resolve().parent
+    for fname in _PIPELINE_SOURCE_FILES:
+        path = this_dir / fname
+        if path.exists():
+            h.update(path.read_bytes())
+    return h.hexdigest()
+
+
 def _embed_fingerprint() -> dict:
-    """Config knobs that change what gets embedded — cache must invalidate if any change."""
+    """Config knobs + pipeline code version that change what gets embedded —
+    cache must invalidate if any change."""
     return {
         "embedding_model": Config.OPENAI_EMBEDDING_MODEL if Config.use_openai() else Config.EMBEDDING_MODEL,
         "chunk_size": Config.CHUNK_SIZE,
         "chunk_overlap": Config.CHUNK_OVERLAP,
+        "chunking_strategy": Config.CHUNKING_STRATEGY,
+        "near_dup_dedup_enabled": Config.NEAR_DUP_DEDUP_ENABLED,
+        "near_dup_threshold": Config.NEAR_DUP_THRESHOLD,
         "contextual_retrieval": Config.CONTEXTUAL_RETRIEVAL,
+        "pipeline_code_hash": _pipeline_code_hash(),
     }
 
 
@@ -606,20 +729,24 @@ def build_vector_store(file_path: str, store_path: str, doc_id: str = "default")
             raise ValueError("No content loaded from document")
 
         logger.info(f"Loaded {len(docs)} page(s)/section(s)")
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=Config.CHUNK_SIZE,
-            chunk_overlap=Config.CHUNK_OVERLAP,
-            length_function=len,
-            separators=["\n\n", "\n", " ", ""],
+        embeddings = get_embeddings()
+
+        chunks = chunking.split_documents(
+            docs,
+            Config.CHUNKING_STRATEGY,
+            Config.CHUNK_SIZE,
+            Config.CHUNK_OVERLAP,
+            embeddings=embeddings,
+            semantic_breakpoint_percentile=Config.SEMANTIC_CHUNK_BREAKPOINT_PERCENTILE,
+            semantic_min_chars=Config.SEMANTIC_CHUNK_MIN_CHARS,
         )
-        chunks = splitter.split_documents(docs)
         chunks = _deduplicate_chunks(chunks)
-        logger.info(f"Created {len(chunks)} chunks after deduplication")
+        if Config.NEAR_DUP_DEDUP_ENABLED:
+            chunks = _deduplicate_near_duplicates(chunks, embeddings, Config.NEAR_DUP_THRESHOLD)
+        logger.info(f"Created {len(chunks)} chunks after deduplication (strategy: {Config.CHUNKING_STRATEGY})")
 
         full_text = "\n\n".join(d.page_content for d in docs)
         chunks = _contextualize_chunks(chunks, full_text)
-
-        embeddings = get_embeddings()
 
         use_qdrant = bool(Config.QDRANT_URL) and _has_internet()
         if use_qdrant:

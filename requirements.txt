@@ -1,6 +1,7 @@
 # Core Web Framework
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9   # required for FastAPI UploadFile (POST /documents/ingest)
 
 # LangChain ecosystem
 langchain>=0.1.0
@@ -19,6 +20,7 @@ tiktoken>=0.7.0                # token counting for the latency panel (tokens/se
 sentence-transformers>=2.6.0
 transformers>=4.30.0
 torch>=2.0.0
+numpy>=1.24.0   # used directly by app/chunking.py (semantic chunking similarity math)
 
 # Vector Database
 faiss-cpu>=1.7.0          # local offline fallback
@@ -40,6 +42,10 @@ Pillow>=9.0.0         # Image handling for OCR
 
 # Gradio UI
 gradio>=6.0.0,<7.0.0
+
+# Streamlit — interview demo dashboard (streamlit_app.py): confidence breakdown,
+# clickable citations, hybrid-vs-dense-only retrieval comparison
+streamlit>=1.38.0
 
 # Hybrid retrieval
 rank-bm25>=0.2.2

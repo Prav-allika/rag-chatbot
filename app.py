@@ -28,6 +28,7 @@ from app.rag_pipeline import (  # noqa: E402
     _SUPPORTED_EXTENSIONS,
     Config,
 )
+from app.citations import verify_citations  # noqa: E402
 
 # ---------- Redis conversation history ----------
 _redis_client = None
@@ -161,7 +162,7 @@ def strip_emojis(text):
 loaded_docs = {}          # {name: qa_chain}
 current_doc_name = None
 question_count = 0
-last_eval_data = {"question": "", "answer": "", "contexts": []}   # for RAGAS button
+last_eval_data = {"question": "", "answer": "", "contexts": [], "sources": []}   # for RAGAS + citation verification buttons
 
 
 def format_stats():
@@ -299,6 +300,7 @@ def ask_question(question, history_text):
         query_type = final_update.get("query_type", "")
         sources = final_update.get("sources", [])
         cache_hit = final_update.get("cache_hit", False)
+        confidence = final_update.get("confidence", {})
 
         # Output Guard — redact PII from the generated answer
         clean_answer, redacted_types = redact_pii(raw_answer)
@@ -312,6 +314,8 @@ def ask_question(question, history_text):
             labels.append(f"CRAG: {grade}")
         if query_type and query_type != "N/A":
             labels.append(f"Type: {query_type}")
+        if confidence.get("composite") is not None:
+            labels.append(f"Confidence: {confidence['composite']:.2f}")
         if redacted_types:
             labels.append(f"PII Redacted: {', '.join(set(redacted_types))}")
 
@@ -375,11 +379,12 @@ def ask_question(question, history_text):
     )
     updated_history = history_text + new_entry
 
-    # Store for RAGAS evaluation button
+    # Store for RAGAS evaluation button + citation verification button
     if final_update and final_update.get("sources"):
         last_eval_data["question"] = question
         last_eval_data["answer"] = answer
         last_eval_data["contexts"] = [s["content"] for s in final_update["sources"]]
+        last_eval_data["sources"] = final_update["sources"]
 
     # Persist conversation history to Redis
     _save_history(current_doc_name, updated_history)
@@ -505,6 +510,60 @@ def run_evaluation():
         sep,
         "Score: 0.0 = poor   0.5 = acceptable   1.0 = perfect",
     ]
+    return "\n".join(lines)
+
+
+def run_citation_verification():
+    """
+    Parse the last answer's superscript citations and check each one against
+    its cited source chunk's full text via LLM-as-judge. Flags unsupported
+    citations instead of trusting that a citation number means the claim is
+    actually grounded.
+    """
+    q = last_eval_data.get("question", "")
+    a = last_eval_data.get("answer", "")
+    sources = last_eval_data.get("sources", [])
+
+    if not q:
+        return "Ask a question first, then click Verify."
+    if not sources:
+        return "No source chunks were returned for the last answer — nothing to verify."
+
+    result = verify_citations(a, sources)
+    citations = result["citations"]
+    uncited = result["uncited_sentences"]
+
+    sep = "-" * 56
+    lines = [
+        "Citation Verification  (LLM-judged, one call per cited sentence)",
+        sep,
+        f"Question: {q[:80]}{'...' if len(q) > 80 else ''}",
+        sep,
+    ]
+
+    cov_bar = "#" * int(result["coverage"] * 20)
+    acc_bar = "#" * int(result["accuracy"] * 20)
+    lines.append(f"Coverage   {result['coverage']:.3f}  [{cov_bar:<20}]  claims with a citation attached")
+    lines.append(f"Accuracy   {result['accuracy']:.3f}  [{acc_bar:<20}]  citations actually supported by their source")
+
+    unsupported = [c for c in citations if not c["supported"]]
+    if unsupported:
+        lines += [sep, f"UNSUPPORTED CITATIONS ({len(unsupported)}):"]
+        for c in unsupported[:5]:
+            src = ", ".join(str(n) for n in c["cited_sources"])
+            lines.append(f"  [{src}] \"{c['sentence'][:100]}\"")
+            lines.append(f"        -> {c['reason']}")
+        if len(unsupported) > 5:
+            lines.append(f"  ... and {len(unsupported) - 5} more")
+    elif citations:
+        lines += [sep, "All cited claims were supported by their source chunk."]
+
+    if uncited:
+        lines += [sep, f"UNCITED CLAIMS ({len(uncited)}) — stated without a source number:"]
+        for s in uncited[:5]:
+            lines.append(f"  \"{s[:100]}\"")
+
+    lines += [sep, "0.0 = poor   1.0 = perfect"]
     return "\n".join(lines)
 
 
@@ -1023,6 +1082,23 @@ with gr.Blocks(
                     elem_id="eval-box",
                 )
 
+        with gr.Tab("Phase 4 — Citation Verification"):
+            gr.Markdown(
+                "Checks whether each cited superscript (¹²³) in the last answer is actually "
+                "supported by the source chunk it points to, and flags claims with no citation at all.  \n"
+                "Uses your configured LLM — one extra call per cited sentence, takes a few seconds."
+            )
+            with gr.Row():
+                verify_btn = gr.Button("Verify Citations (Last Answer)", variant="secondary", scale=1)
+                citation_box = gr.Textbox(
+                    label="Citation Verification",
+                    value="",
+                    interactive=False,
+                    lines=10,
+                    scale=3,
+                    elem_id="citation-box",
+                )
+
     gr.Markdown(
         "Built with [LangChain](https://langchain.com) · "
         "[FAISS](https://github.com/facebookresearch/faiss) · "
@@ -1064,6 +1140,7 @@ with gr.Blocks(
     )
     eval_btn.click(fn=run_evaluation, inputs=[], outputs=[eval_box])
     phase1_btn.click(fn=run_phase1_eval, inputs=[], outputs=[phase1_box])
+    verify_btn.click(fn=run_citation_verification, inputs=[], outputs=[citation_box])
     thumbs_up_btn.click(fn=thumbs_up, inputs=[], outputs=[feedback_status, stats_bar])
     thumbs_down_btn.click(fn=thumbs_down, inputs=[], outputs=[feedback_status, stats_bar])
 

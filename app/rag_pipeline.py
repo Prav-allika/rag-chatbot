@@ -28,6 +28,7 @@ import threading
 import numpy as np
 from functools import lru_cache
 from collections import OrderedDict
+from itertools import zip_longest
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.prompts import PromptTemplate
@@ -41,6 +42,7 @@ from app.evaluation import (
     evaluate_retrieval_metrics,
     evaluate_rag_response,
 )
+from app.confidence import compute_confidence
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +70,7 @@ _QUERY_PROMPTS = {
 STRICT RULES — violating any of these is an error:
   1. Do NOT use your general knowledge or training data.
   2. Do NOT fabricate connections between the question and unrelated content.
-  3. Do NOT speculate or infer beyond what the context explicitly states.
+  3. Do NOT invent facts that are not stated anywhere in the context. You MAY connect, combine, or compare multiple facts that are each explicitly stated in the context — even if they appear in different Source blocks. That is synthesis, not speculation, and answering multi-part questions often requires it.
   4. If the exact answer is not present in the context, respond with exactly:
      "This question is not covered in the loaded document. Please ask something about the document content."
   5. After each sentence drawn from the context, place a superscript number at the end of the sentence (e.g. ¹ for Source 1, ² for Source 2, ³ for Source 3). No brackets, no "Source" word — just the tiny number. Example: "Random forests outperform single decision trees on most benchmarks.¹"
@@ -81,7 +83,7 @@ Answer:""",
 
     "CONCEPTUAL": """Explain the concept below using the document context provided.
 STRICT RULES — violating any of these is an error:
-  1. Every fact, claim, or number about the document's subject matter must come from the context below — do NOT use general knowledge to explain what the document itself says or claims.
+  1. Every fact, claim, or number about the document's subject matter must come from the context below — do NOT use general knowledge to explain what the document itself says or claims. You MAY combine multiple facts that are each explicitly stated in the context, even across different Source blocks — that is synthesis, not general knowledge.
   2. Do NOT fabricate connections between the question and unrelated content.
   3. If the concept is not explained in the context, respond with exactly:
      "This question is not covered in the loaded document. Please ask something about the document content."
@@ -98,7 +100,7 @@ Explanation:""",
 STRICT RULES — violating any of these is an error:
   1. Do NOT use your general knowledge or training data.
   2. Do NOT fabricate connections between the question and unrelated content.
-  3. Do NOT speculate or infer beyond what the context explicitly states.
+  3. Do NOT invent facts that are not stated anywhere in the context. You MAY connect, combine, or compare multiple facts that are each explicitly stated in the context — even if they appear in different Source blocks. That is synthesis, not speculation, and answering multi-part questions often requires it.
   4. If the comparison cannot be drawn from the context, respond with exactly:
      "This question is not covered in the loaded document. Please ask something about the document content."
   5. After each sentence drawn from the context, place a superscript number at the end of the sentence (e.g. ¹ for Source 1, ² for Source 2, ³ for Source 3). No brackets, no "Source" word — just the tiny number. Example: "Random forests outperform single decision trees on most benchmarks.¹"
@@ -141,6 +143,7 @@ def _is_complex_query(question: str) -> bool:
         r"\band explain\b", r"\band describe\b", r"\band also\b",
         r"\badditionally\b", r"\bfurthermore\b", r"\bas well as\b",
         r"compare .{3,} and", r"difference between .{3,} and",
+        r"compared (to|with) .{3,} and", r"\band how (many|much|does|did)\b",
     ]
     q = question.lower()
     return any(re.search(p, q) for p in patterns)
@@ -329,18 +332,9 @@ def get_embeddings():
 
 @lru_cache(maxsize=1)
 def get_llm():
-    """Return LLM (cached). Priority: Groq > OpenAI > HuggingFace FLAN-T5."""
+    """Return LLM (cached). Priority: OpenAI > Groq > HuggingFace FLAN-T5."""
     try:
-        if Config.use_groq():
-            logger.info(f"Using Groq: {Config.GROQ_MODEL}")
-            from langchain_groq import ChatGroq
-            return ChatGroq(
-                model=Config.GROQ_MODEL,
-                groq_api_key=Config.GROQ_API_KEY,
-                temperature=Config.LLM_TEMPERATURE,
-                max_tokens=Config.LLM_MAX_OUTPUT_TOKENS,
-            )
-        elif Config.use_openai():
+        if Config.use_openai():
             logger.info(f"Using OpenAI: {Config.OPENAI_MODEL}")
             from langchain_openai import ChatOpenAI
             # gpt-5.x models reject `temperature` (reasoning models use
@@ -361,6 +355,15 @@ def get_llm():
             else:
                 kwargs["temperature"] = Config.LLM_TEMPERATURE
             return ChatOpenAI(**kwargs)
+        elif Config.use_groq():
+            logger.info(f"Using Groq: {Config.GROQ_MODEL}")
+            from langchain_groq import ChatGroq
+            return ChatGroq(
+                model=Config.GROQ_MODEL,
+                groq_api_key=Config.GROQ_API_KEY,
+                temperature=Config.LLM_TEMPERATURE,
+                max_tokens=Config.LLM_MAX_OUTPUT_TOKENS,
+            )
         else:
             logger.info(f"Using HuggingFace LLM: {Config.LLM_MODEL}")
             from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
@@ -476,6 +479,22 @@ def rerank_and_grade(query: str, docs: list, top_k: int) -> tuple:
         f"kept {len(filtered)}/{len(docs)} chunks"
     )
     return filtered[:top_k], grade
+
+
+def dense_only_retrieve(vector_store, query: str, k_initial: int = None, k_final: int = None) -> tuple:
+    """
+    Dense-only retrieval (no BM25/RRF fusion) + rerank — for comparing against
+    the hybrid path. Goes through the same rerank_and_grade() as hybrid retrieval,
+    so the comparison isn't skewed by different scoring logic.
+    Returns (filtered_docs, grade), same shape as rerank_and_grade().
+    """
+    k_initial = k_initial or Config.RETRIEVAL_K_INITIAL
+    k_final = k_final or Config.RETRIEVAL_K
+    retriever = vector_store.as_retriever(
+        search_type=Config.SEARCH_TYPE, search_kwargs={"k": k_initial}
+    )
+    docs = retriever.invoke(query)
+    return rerank_and_grade(query, docs, k_final)
 
 
 # =============================================================================
@@ -663,16 +682,18 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                 sparse = [self._bm25_docs[i] for i in top_idx]
 
                 rrf_k = 60
+                dense_weight = Config.RRF_DENSE_WEIGHT
+                sparse_weight = 1.0 - dense_weight
                 content_to_doc = {}
                 rrf = {}
                 for rank, doc in enumerate(dense):
                     k = doc.page_content
                     content_to_doc[k] = doc
-                    rrf[k] = rrf.get(k, 0.0) + 1.0 / (rrf_k + rank)
+                    rrf[k] = rrf.get(k, 0.0) + dense_weight / (rrf_k + rank)
                 for rank, doc in enumerate(sparse):
                     k = doc.page_content
                     content_to_doc[k] = doc
-                    rrf[k] = rrf.get(k, 0.0) + 1.0 / (rrf_k + rank)
+                    rrf[k] = rrf.get(k, 0.0) + sparse_weight / (rrf_k + rank)
 
                 merged = sorted(rrf, key=lambda x: rrf[x], reverse=True)
                 fused = [content_to_doc[k] for k in merged[:Config.RETRIEVAL_K_INITIAL]]
@@ -701,20 +722,42 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                 else:
                     sub_queries = [standalone_q]
 
-                seen: set = set()
-                all_docs = []
-                for sq in sub_queries:
-                    for doc in self._hybrid_retrieve(sq):
-                        key = doc.page_content[:80]
-                        if key not in seen:
-                            seen.add(key)
-                            all_docs.append(doc)
+                if len(sub_queries) > 1:
+                    # Rerank each sub-question's retrieval against ITSELF, then
+                    # interleave — reranking a merged pool only against the combined
+                    # question (the old behavior) can crowd out chunks that match just
+                    # one sub-topic even when the answer needs facts from all of them.
+                    # (Observed in eval: decomposed multi-hop questions scored *worse*
+                    # than non-decomposed ones — this crowding-out was the cause.)
+                    seen: set = set()
+                    per_sq_results = []
+                    for sq in sub_queries:
+                        retrieved = self._hybrid_retrieve(sq)
+                        graded, _ = rerank_and_grade(sq, retrieved, Config.RETRIEVAL_K)
+                        per_sq_results.append(graded)
 
-                all_docs = all_docs[: Config.RETRIEVAL_K_INITIAL * 2]
-                graded_docs, grade = rerank_and_grade(
-                    standalone_q, all_docs, Config.RETRIEVAL_K
-                )
-                return standalone_q, graded_docs, grade
+                    merged_docs = []
+                    for docs in zip_longest(*per_sq_results):
+                        for doc in docs:
+                            if doc is None:
+                                continue
+                            key = doc.page_content[:80]
+                            if key not in seen:
+                                seen.add(key)
+                                merged_docs.append(doc)
+                    merged_docs = merged_docs[: Config.RETRIEVAL_K * len(sub_queries)]
+
+                    # Score/grade against the full original question without cutting
+                    # further — every subquery-matched chunk already earned its place.
+                    if merged_docs:
+                        graded_docs, grade = rerank_and_grade(standalone_q, merged_docs, len(merged_docs))
+                    else:
+                        graded_docs, grade = [], "INCORRECT"
+                else:
+                    retrieved = self._hybrid_retrieve(sub_queries[0])
+                    graded_docs, grade = rerank_and_grade(standalone_q, retrieved, Config.RETRIEVAL_K)
+
+                return standalone_q, graded_docs, grade, len(sub_queries)
 
             # ----------------------------------------------------------------
             # Non-streaming invoke
@@ -726,18 +769,21 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                 if cached is not None:
                     return {**cached, "cache_hit": True}
 
-                standalone_q, graded_docs, grade = self._preprocess(inputs)
+                standalone_q, graded_docs, grade, sub_query_count = self._preprocess(inputs)
 
                 if grade in ("INCORRECT", "AMBIGUOUS") or not graded_docs:
+                    refusal_grade = grade if graded_docs else "INCORRECT"
+                    refusal_msg = (
+                        "This question is not covered in the loaded document. "
+                        "Please ask something about the document content."
+                    )
                     return {
-                        "result": (
-                            "This question is not covered in the loaded document. "
-                            "Please ask something about the document content."
-                        ),
+                        "result": refusal_msg,
                         "sources": [],
-                        "grade": grade if graded_docs else "INCORRECT",
+                        "grade": refusal_grade,
                         "query_type": "N/A",
                         "cache_hit": False,
+                        "confidence": compute_confidence(refusal_msg, graded_docs, refusal_grade, sub_query_count),
                     }
 
                 query_type = classify_query(standalone_q)
@@ -757,6 +803,7 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                     {
                         "chunk": i + 1,
                         "content": doc.metadata.get("original_content", doc.page_content)[:300],
+                        "full_content": doc.metadata.get("original_content", doc.page_content),
                         "page": doc.metadata.get("page", "N/A"),
                         "score": doc.metadata.get("rerank_score", "N/A"),
                         "method": doc.metadata.get("extract_method", ""),
@@ -771,6 +818,7 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                     "cache_hit": False,
                     "generated_tokens": _count_tokens(result),
                     "cached_tokens": _extract_cached_tokens(raw_result),
+                    "confidence": compute_confidence(result, graded_docs, grade, sub_query_count),
                 }
                 self._cache.store(question, {k: v for k, v in payload.items() if k != "cache_hit"})
                 return payload
@@ -798,11 +846,12 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                         "query_type": cached.get("query_type", ""),
                         "cache_hit": True,
                         "done": True,
+                        "confidence": cached.get("confidence", {}),
                     }
                     return
 
                 try:
-                    standalone_q, graded_docs, grade = self._preprocess(inputs)
+                    standalone_q, graded_docs, grade, sub_query_count = self._preprocess(inputs)
                 except Exception as e:
                     yield {
                         "chunk": "", "result": str(e),
@@ -816,10 +865,12 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                         "This question is not covered in the loaded document. "
                         "Please ask something about the document content."
                     )
+                    refusal_grade = grade if graded_docs else "INCORRECT"
                     yield {
                         "chunk": msg, "result": msg,
-                        "sources": [], "grade": grade if graded_docs else "INCORRECT",
+                        "sources": [], "grade": refusal_grade,
                         "query_type": "N/A", "cache_hit": False, "done": True,
+                        "confidence": compute_confidence(msg, graded_docs, refusal_grade, sub_query_count),
                     }
                     return
 
@@ -835,6 +886,7 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                     {
                         "chunk": i + 1,
                         "content": doc.metadata.get("original_content", doc.page_content)[:300],
+                        "full_content": doc.metadata.get("original_content", doc.page_content),
                         "page": doc.metadata.get("page", "N/A"),
                         "score": doc.metadata.get("rerank_score", "N/A"),
                         "method": doc.metadata.get("extract_method", ""),
@@ -882,12 +934,14 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
 
                 generated_tokens = _count_tokens(full_answer)
                 cached_tokens = _extract_cached_tokens(accumulated_msg)
+                confidence = compute_confidence(full_answer, graded_docs, grade, sub_query_count)
 
                 self._cache.store(question, {
                     "result": full_answer,
                     "sources": sources,
                     "grade": grade,
                     "query_type": query_type,
+                    "confidence": confidence,
                 })
 
                 yield {
@@ -900,6 +954,7 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                     "done": True,
                     "generated_tokens": generated_tokens,
                     "cached_tokens": cached_tokens,
+                    "confidence": confidence,
                 }
 
             def run(self, question: str) -> str:

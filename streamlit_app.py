@@ -1,0 +1,570 @@
+"""
+streamlit_app.py — interview demo dashboard.
+
+Not a replacement for the Gradio app (app.py) or the FastAPI surface
+(app/main.py) — this is a small, focused view built to demonstrate the
+pipeline's differentiators: a confidence score broken into its parts,
+clickable citations, and a side-by-side hybrid-vs-dense-only retrieval
+comparison (Project 6 spec, Phase 5.2). Same palette as app.py (Gradio),
+so the two look like one product.
+
+Two tabs: "PDF Upload" (upload/select a document, ask, compare retrieval)
+and "Golden Set" (the 50-question eval results). Run with:
+
+    streamlit run streamlit_app.py
+"""
+
+import html
+import json
+import os
+import re
+import tempfile
+
+import streamlit as st
+
+from app.config import Config
+from app.document_loader import _SUPPORTED_EXTENSIONS
+from app.rag_pipeline import build_vector_store, load_vector_store, make_qa_chain, dense_only_retrieve
+
+STORE_PATH = "artifacts/vector_store"
+DOC_ID = "Attention.pdf"
+GOLDEN_RESULTS_PATH = "artifacts/eval/golden_eval_results.jsonl"
+
+# Outline icons (Feather-style: stroke-based, no fill) -- used next to section
+# labels instead of emoji.
+_ICON_ATTRS = 'width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"'
+_ICONS = {
+    "document": f'<svg {_ICON_ATTRS}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>',
+    "message": f'<svg {_ICON_ATTRS}><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>',
+    "check": f'<svg {_ICON_ATTRS}><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+    "activity": f'<svg {_ICON_ATTRS}><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
+    "bookmark": f'<svg {_ICON_ATTRS}><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>',
+    "layers": f'<svg {_ICON_ATTRS}><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>',
+    "target": f'<svg {_ICON_ATTRS}><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
+    "grid": f'<svg {_ICON_ATTRS}><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
+}
+
+st.set_page_config(page_title="RAG Pipeline Dashboard", layout="wide")
+
+# Palette matches app.py (Gradio): #FFD3AC (light peach) / #FFB5AB (rose) /
+# #E39A7B (terracotta) / #DBB06B (gold), cream page background.
+_FONTS = """
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+"""
+
+_CSS = """
+<style>
+html, body, [class*="css"] { font-family: 'Plus Jakarta Sans', -apple-system, sans-serif !important; }
+
+.stApp {
+    background:
+        radial-gradient(640px circle at 12% 8%, rgba(219,176,107,0.22), transparent 60%),
+        radial-gradient(720px circle at 88% 6%, rgba(227,154,123,0.20), transparent 60%),
+        radial-gradient(680px circle at 78% 92%, rgba(255,181,171,0.20), transparent 60%),
+        radial-gradient(600px circle at 8% 88%, rgba(219,176,107,0.16), transparent 60%),
+        linear-gradient(160deg, #FFF8F2 0%, #FFF0E6 50%, #FFE8DA 100%) !important;
+    background-attachment: fixed !important;
+}
+.block-container { max-width: 1200px; padding-top: 1.5rem; }
+
+.app-header {
+    background: linear-gradient(135deg, #DBB06B 0%, #E39A7B 55%, #FFB5AB 100%);
+    border-radius: 18px;
+    padding: 30px 40px 26px;
+    margin-bottom: 22px;
+    box-shadow: 0 8px 32px rgba(219,176,107,0.28);
+    text-align: center;
+}
+.app-header h1 {
+    font-family: 'Fraunces', Georgia, serif;
+    color: #FFFFFF;
+    font-size: 2.4em;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    margin: 0 0 8px 0;
+    text-shadow: 0 2px 8px rgba(100,40,10,0.18);
+}
+.app-header p {
+    color: rgba(255,255,255,0.9);
+    font-size: 0.92em;
+    margin: 0;
+    letter-spacing: 0.01em;
+}
+
+.section-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    background: linear-gradient(135deg, #E39A7B 0%, #DBB06B 100%);
+    color: #FFFFFF;
+    font-size: 0.72em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    border-radius: 8px;
+    padding: 6px 14px;
+    margin: 4px 0 12px 0;
+    box-shadow: 0 2px 8px rgba(227,154,123,0.22);
+}
+.section-label svg { flex-shrink: 0; }
+
+/* Cards */
+[data-testid="stVerticalBlockBorderWrapper"] {
+    background: #FFFFFF;
+    border-radius: 14px !important;
+    border: 1px solid #FFD3AC !important;
+    box-shadow: 0 2px 14px rgba(219,176,107,0.10);
+}
+
+/* Buttons */
+.stButton > button, [data-testid^="stBaseButton"] {
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+    transition: all 0.15s ease !important;
+}
+.stButton > button[kind="primary"], [data-testid="stBaseButton-primary"] {
+    background: linear-gradient(130deg, #DBB06B 0%, #E39A7B 100%) !important;
+    color: #FFFFFF !important;
+    border: none !important;
+    box-shadow: 0 3px 12px rgba(219,176,107,0.32) !important;
+}
+.stButton > button[kind="primary"]:hover, [data-testid="stBaseButton-primary"]:hover {
+    background: linear-gradient(130deg, #E39A7B 0%, #DBB06B 100%) !important;
+    box-shadow: 0 6px 20px rgba(227,154,123,0.42) !important;
+}
+.stButton > button[kind="secondary"], [data-testid="stBaseButton-secondary"] {
+    background: #FFFFFF !important;
+    color: #C9713F !important;
+    border: 1.5px solid #FFB5AB !important;
+}
+.stButton > button[kind="secondary"]:hover, [data-testid="stBaseButton-secondary"]:hover {
+    background: #FFF5EE !important;
+    border-color: #E39A7B !important;
+    color: #A5502A !important;
+}
+
+/* Inputs */
+.stTextInput input, .stSelectbox div[data-baseweb="select"] > div {
+    background: #FFFFFF !important;
+    border-color: #FFD3AC !important;
+    border-radius: 10px !important;
+    color: #3D1A06 !important;
+}
+
+/* Progress bars (confidence) */
+.stProgress > div > div { background: #FFE3CC !important; }
+.stProgress > div > div > div { background: linear-gradient(90deg, #DBB06B 0%, #E39A7B 100%) !important; }
+
+/* Metrics */
+[data-testid="stMetricValue"] { color: #7A4020 !important; }
+[data-testid="stMetricLabel"] { color: #A06030 !important; }
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] { border-bottom: 2px solid #FFD3AC; gap: 4px; }
+.stTabs [data-baseweb="tab"] {
+    color: #C8A080;
+    font-weight: 600;
+    font-size: 0.94em;
+    padding: 10px 20px;
+}
+.stTabs [aria-selected="true"] { color: #E39A7B !important; border-bottom-color: #E39A7B !important; }
+
+/* File uploader */
+[data-testid="stFileUploaderDropzone"] {
+    background: #FFF5EE !important;
+    border: 2px dashed #FFB5AB !important;
+    border-radius: 12px !important;
+}
+
+/* Body text */
+p, li, .stMarkdown, label { color: #3D1A06; }
+.stCaption, [data-testid="stCaptionContainer"] { color: #A06030 !important; }
+hr { border-color: #FFD3AC !important; }
+
+/* Answer card */
+.answer-card {
+    background: #FFFEF8;
+    border: 1px solid #FFD3AC;
+    border-left: 4px solid #DBB06B;
+    border-radius: 10px;
+    padding: 22px 26px;
+    font-size: 1.06em;
+    line-height: 1.85;
+    color: #3D1A06;
+}
+.answer-card p { margin: 0 0 14px 0; font-size: 1em; line-height: inherit; }
+.answer-card p:last-child { margin-bottom: 0; }
+.answer-card .cite {
+    color: #C9713F;
+    font-weight: 700;
+    font-size: 1.15em;
+    padding: 0 1px;
+}
+.answer-card .analogy {
+    display: block;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px dashed #FFD3AC;
+    color: #7A4020;
+    font-style: italic;
+}
+
+/* Snippet text in Sources / comparison */
+.snippet {
+    font-size: 0.88em;
+    line-height: 1.7;
+    color: #5A3010;
+}
+.meta-line {
+    font-size: 0.78em;
+    color: #A06030;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    margin-bottom: 4px;
+}
+</style>
+"""
+
+
+@st.cache_resource
+def load_default_pipeline():
+    try:
+        vs, chunks = load_vector_store(STORE_PATH, doc_id=DOC_ID)
+    except Exception:
+        if Config.QDRANT_URL:
+            # Qdrant configured but unreachable -- fall back to local FAISS
+            # rather than let a demo fail on a flaky cloud dependency.
+            Config.QDRANT_URL = ""
+            vs, chunks = load_vector_store(STORE_PATH, doc_id=DOC_ID)
+        else:
+            raise
+    chain = make_qa_chain(vs, doc_id=DOC_ID, all_chunks=chunks)
+    return vs, chain
+
+
+def ingest_uploaded_file(uploaded_file) -> str:
+    """Builds a vector store + QA chain for a newly uploaded file and adds it
+    to st.session_state.loaded_docs. Returns the doc name. Mirrors app.py's
+    load_document() upload flow (same build_vector_store/make_qa_chain calls)."""
+    name = uploaded_file.name
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in _SUPPORTED_EXTENSIONS:
+        supported = ", ".join(sorted(_SUPPORTED_EXTENSIONS))
+        raise ValueError(f"Unsupported file type '{ext}'. Supported: {supported}")
+
+    tmp_dir = tempfile.mkdtemp()
+    file_path = os.path.join(tmp_dir, name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getvalue())
+
+    store_path = os.path.join(tmp_dir, "vector_store")
+    vs, chunks = build_vector_store(file_path, store_path, doc_id=name)
+    chain = make_qa_chain(vs, doc_id=name, all_chunks=chunks)
+
+    st.session_state.loaded_docs[name] = {"vs": vs, "chain": chain}
+    return name
+
+
+@st.cache_data
+def load_golden_eval_summary():
+    """Reads the most recent full (50-question) golden eval run and returns
+    a per-category correctness breakdown, or None if no full run is recorded."""
+    if not os.path.exists(GOLDEN_RESULTS_PATH):
+        return None
+    latest_full_run = None
+    with open(GOLDEN_RESULTS_PATH) as f:
+        for line in f:
+            run = json.loads(line)
+            if run.get("n_questions") == 50:
+                latest_full_run = run
+    if latest_full_run is None:
+        return None
+
+    by_category = {}
+    for r in latest_full_run["results"]:
+        cat = r["category"]
+        by_category.setdefault(cat, [0, 0])
+        by_category[cat][1] += 1
+        if r["correct"]:
+            by_category[cat][0] += 1
+
+    total_correct = sum(c for c, _ in by_category.values())
+    total_n = sum(n for _, n in by_category.values())
+    return {
+        "timestamp": latest_full_run["timestamp"],
+        "by_category": by_category,
+        "overall": (total_correct, total_n),
+    }
+
+
+def _snippet_key(text: str) -> str:
+    return text[:80]
+
+
+def _section_label(text: str, icon: str = None):
+    icon_html = _ICONS.get(icon, "") if icon else ""
+    st.markdown(f'<div class="section-label">{icon_html}{text}</div>', unsafe_allow_html=True)
+
+
+def _bar_row(label: str, correct: int, total: int):
+    pct = (correct / total) if total else 0.0
+    st.markdown(
+        f"""
+        <div style="margin-bottom:14px;">
+          <div style="display:flex; justify-content:space-between; font-size:0.88em; color:#5A3010; margin-bottom:4px;">
+            <span style="font-weight:600; text-transform:capitalize;">{label}</span>
+            <span>{correct}/{total} &middot; {pct:.0%}</span>
+          </div>
+          <div style="background:#FFE3CC; border-radius:8px; height:10px; overflow:hidden;">
+            <div style="width:{pct*100:.1f}%; height:100%; background:linear-gradient(90deg,#DBB06B,#E39A7B); border-radius:8px;"></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+_SUPERSCRIPT_RUN = re.compile(r"[⁰¹²³⁴-⁹]+")
+
+
+def _format_answer_html(text: str) -> str:
+    """Escapes the answer text, highlights citation superscripts (¹²³) as
+    styled spans, and sets off the "Analogy:" line (if present) distinctly --
+    same convention the prompt uses (rag_pipeline.py:_QUERY_PROMPTS)."""
+    paragraphs = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        escaped = html.escape(line)
+        escaped = _SUPERSCRIPT_RUN.sub(lambda m: f'<span class="cite">{m.group(0)}</span>', escaped)
+        if line.startswith("Analogy:"):
+            paragraphs.append(f'<span class="analogy">{escaped}</span>')
+        else:
+            paragraphs.append(f"<p>{escaped}</p>")
+    return "\n".join(paragraphs)
+
+
+def render_sources_panel(sources: list, selected_key: str):
+    cols = st.columns(len(sources)) if len(sources) <= 6 else [st] * len(sources)
+    for col, s in zip(cols, sources):
+        chunk_num = s["chunk"]
+        is_selected = st.session_state.get(selected_key) == chunk_num
+        with col:
+            if st.button(
+                f"Source {chunk_num}",
+                key=f"{selected_key}_btn_{chunk_num}",
+                type="primary" if is_selected else "secondary",
+                use_container_width=True,
+            ):
+                st.session_state[selected_key] = None if is_selected else chunk_num
+                # Buttons render top-to-bottom as st.button() is called, so
+                # without an immediate rerun, buttons ABOVE this one in the row
+                # keep their stale highlight for this pass -- only a fresh
+                # rerun redraws the whole row consistently from the new state.
+                st.rerun()
+
+    active = st.session_state.get(selected_key)
+    if active is not None:
+        match = next((s for s in sources if s["chunk"] == active), None)
+        if match:
+            with st.container(border=True):
+                st.markdown(
+                    f'<div class="meta-line">SOURCE {active} &middot; PAGE {match.get("page", "N/A")} '
+                    f'&middot; RERANK SCORE {match.get("score", "N/A")}</div>',
+                    unsafe_allow_html=True,
+                )
+                content = html.escape(match.get("full_content", match.get("content", "")))
+                st.markdown(f'<div class="snippet">{content}</div>', unsafe_allow_html=True)
+
+
+def render_comparison(hybrid_sources: list, dense_docs: list):
+    hybrid_keys = {_snippet_key(s.get("full_content", s.get("content", ""))) for s in hybrid_sources}
+    dense_keys = {_snippet_key(d.metadata.get("original_content", d.page_content)) for d in dense_docs}
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        with st.container(border=True):
+            st.markdown("**Hybrid** (BM25 + dense, RRF-fused)")
+            for s in hybrid_sources:
+                content = s.get("full_content", s.get("content", ""))
+                overlap = " &middot; ALSO IN DENSE-ONLY" if _snippet_key(content) in dense_keys else ""
+                st.markdown(
+                    f'<div class="meta-line">PAGE {s.get("page", "N/A")} &middot; SCORE {s.get("score", "N/A")}{overlap}</div>'
+                    f'<div class="snippet">{html.escape(content[:220])}</div><div style="height:12px"></div>',
+                    unsafe_allow_html=True,
+                )
+
+    with col_b:
+        with st.container(border=True):
+            st.markdown("**Dense-only** (no BM25)")
+            for d in dense_docs:
+                content = d.metadata.get("original_content", d.page_content)
+                overlap = " &middot; ALSO IN HYBRID" if _snippet_key(content) in hybrid_keys else ""
+                st.markdown(
+                    f'<div class="meta-line">PAGE {d.metadata.get("page", "N/A")} &middot; SCORE {d.metadata.get("rerank_score", "N/A")}{overlap}</div>'
+                    f'<div class="snippet">{html.escape(content[:220])}</div><div style="height:12px"></div>',
+                    unsafe_allow_html=True,
+                )
+
+
+def render_ask_tab():
+    if "loaded_docs" not in st.session_state:
+        st.session_state.loaded_docs = {}
+
+    _section_label("STEP 1 — DOCUMENT", "document")
+    upload_col, select_col = st.columns([2, 1])
+    with upload_col:
+        supported = ", ".join(sorted(_SUPPORTED_EXTENSIONS))
+        uploaded_file = st.file_uploader(f"Upload a document ({supported})", label_visibility="collapsed")
+        if uploaded_file is not None and uploaded_file.name not in st.session_state.loaded_docs:
+            with st.spinner(f"Indexing '{uploaded_file.name}' (calls the embedding API — real cost)..."):
+                try:
+                    name = ingest_uploaded_file(uploaded_file)
+                    st.session_state.active_doc = name
+                    # Selectbox below reads this key directly (see STEP 1 select
+                    # widget) -- setting session_state.active_doc alone isn't
+                    # enough, since a selectbox's own keyed state, once it
+                    # exists, takes priority over a freshly-computed `index=`.
+                    st.session_state["active_doc_select"] = name
+                except Exception as e:
+                    st.error(f"Failed to index '{uploaded_file.name}': {e}")
+
+    try:
+        default_vs, default_chain = load_default_pipeline()
+        st.session_state.loaded_docs.setdefault(DOC_ID, {"vs": default_vs, "chain": default_chain})
+    except Exception as e:
+        st.error(
+            f"Could not load the default vector store at '{STORE_PATH}': {e}\n\n"
+            "Run 'python run_me_once.py' to build it first. You can still upload your own document above."
+        )
+
+    if not st.session_state.loaded_docs:
+        return
+
+    if st.session_state.get("active_doc") not in st.session_state.loaded_docs:
+        st.session_state.active_doc = next(iter(st.session_state.loaded_docs))
+        st.session_state["active_doc_select"] = st.session_state.active_doc
+
+    doc_names = list(st.session_state.loaded_docs.keys())
+    if st.session_state.get("active_doc_select") not in doc_names:
+        st.session_state["active_doc_select"] = st.session_state.active_doc
+
+    with select_col:
+        # key= (not index=) is what makes this reliably reflect a just-ingested
+        # doc -- see the ingest block above, which sets this same key directly.
+        active_doc = st.selectbox("Active document", doc_names, key="active_doc_select")
+    st.session_state.active_doc = active_doc
+    vs = st.session_state.loaded_docs[active_doc]["vs"]
+    chain = st.session_state.loaded_docs[active_doc]["chain"]
+
+    st.write("")
+    _section_label("STEP 2 — ASK", "message")
+    question = st.text_input("Question", label_visibility="collapsed", placeholder="Ask a question about the active document...")
+    st.caption("Calls the configured LLM once per question (real API cost, same as normal use).")
+    ask = st.button("Ask", type="primary", icon=":material/send:")
+
+    if ask and question.strip():
+        with st.spinner("Retrieving and generating..."):
+            result = chain.invoke({"query": question})
+            dense_docs, dense_grade = dense_only_retrieve(vs, question)
+        st.session_state["last_result"] = result
+        st.session_state["last_dense_docs"] = dense_docs
+        st.session_state["last_dense_grade"] = dense_grade
+        st.session_state["selected_source"] = None
+        st.session_state["last_answered_doc"] = active_doc
+
+    if st.session_state.get("last_answered_doc") != active_doc:
+        # Switched documents since the last answer -- don't show a stale answer
+        # against a source-chunk set that no longer matches the active document.
+        return
+
+    result = st.session_state.get("last_result")
+    if result is None:
+        return
+
+    st.write("")
+    _section_label("ANSWER", "check")
+    st.markdown(
+        f'<div class="answer-card">{_format_answer_html(result.get("result", ""))}</div>',
+        unsafe_allow_html=True,
+    )
+
+    confidence = result.get("confidence") or {}
+    if confidence:
+        st.write("")
+        _section_label("CONFIDENCE", "activity")
+        with st.container(border=True):
+            st.metric("Composite", f"{confidence.get('composite', 0):.2f}")
+            c1, c2, c3 = st.columns(3)
+            for col, label, key in [
+                (c1, "Retrieval", "retrieval"),
+                (c2, "Citation coverage", "citation_coverage"),
+                (c3, "Completeness", "completeness"),
+            ]:
+                with col:
+                    st.caption(label)
+                    st.progress(min(max(confidence.get(key, 0), 0.0), 1.0))
+                    st.write(f"{confidence.get(key, 0):.2f}")
+
+    sources = result.get("sources") or []
+    if sources:
+        st.write("")
+        _section_label("SOURCES", "bookmark")
+        st.caption("Click a source to view the chunk it was cited from.")
+        render_sources_panel(sources, "selected_source")
+
+    dense_docs = st.session_state.get("last_dense_docs")
+    if dense_docs is not None and sources:
+        st.write("")
+        _section_label("RETRIEVAL COMPARISON — HYBRID VS. DENSE-ONLY", "layers")
+        render_comparison(sources, dense_docs)
+
+
+def render_golden_tab():
+    summary = load_golden_eval_summary()
+    if summary is None:
+        st.info("No full golden eval run found. Run: python run_golden_eval.py")
+        return
+
+    correct, total = summary["overall"]
+    _section_label("OVERALL", "target")
+    with st.container(border=True):
+        st.metric("Correctness", f"{correct / total:.1%}", f"{correct}/{total} questions")
+        st.caption(f"Last full run: {summary['timestamp']}")
+
+    st.write("")
+    _section_label("BY CATEGORY", "grid")
+    with st.container(border=True):
+        for cat in ["lookup", "multi_hop", "no_answer", "ambiguous"]:
+            if cat in summary["by_category"]:
+                c, n = summary["by_category"][cat]
+                _bar_row(cat.replace("_", " "), c, n)
+
+
+def main():
+    st.markdown(_FONTS, unsafe_allow_html=True)
+    st.markdown(_CSS, unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="app-header">
+          <h1>RAG Pipeline Dashboard</h1>
+          <p>Hybrid BM25 + dense retrieval, cross-encoder reranking, CRAG grading,
+          citation verification, and a composite confidence score.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    tab_ask, tab_golden = st.tabs(["PDF Upload", "Golden Set"])
+    with tab_ask:
+        render_ask_tab()
+    with tab_golden:
+        render_golden_tab()
+
+
+if __name__ == "__main__":
+    main()

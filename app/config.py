@@ -21,11 +21,26 @@ class Config:
     # --- Chunking ---
     CHUNK_SIZE: int       = int(os.getenv("CHUNK_SIZE", 500))
     CHUNK_OVERLAP: int    = int(os.getenv("CHUNK_OVERLAP", 50))
+    CHUNKING_STRATEGY: str = os.getenv("CHUNKING_STRATEGY", "fixed")  # fixed | structure | semantic
+    SEMANTIC_CHUNK_BREAKPOINT_PERCENTILE: int = int(
+        os.getenv("SEMANTIC_CHUNK_BREAKPOINT_PERCENTILE", "90")
+    )
+    SEMANTIC_CHUNK_MIN_CHARS: int = int(os.getenv("SEMANTIC_CHUNK_MIN_CHARS", "200"))
+    NEAR_DUP_DEDUP_ENABLED: bool = os.getenv("NEAR_DUP_DEDUP_ENABLED", "true").lower() == "true"
+    NEAR_DUP_THRESHOLD: float = float(os.getenv("NEAR_DUP_THRESHOLD", "0.95"))
+
+    # --- Composite confidence score (weights are normalized, needn't sum to 1) ---
+    CONFIDENCE_WEIGHT_RETRIEVAL: float   = float(os.getenv("CONFIDENCE_WEIGHT_RETRIEVAL", "0.5"))
+    CONFIDENCE_WEIGHT_COVERAGE: float    = float(os.getenv("CONFIDENCE_WEIGHT_COVERAGE", "0.3"))
+    CONFIDENCE_WEIGHT_COMPLETENESS: float = float(os.getenv("CONFIDENCE_WEIGHT_COMPLETENESS", "0.2"))
 
     # --- Retrieval ---
     RETRIEVAL_K: int         = int(os.getenv("RETRIEVAL_K", 3))
     RETRIEVAL_K_INITIAL: int = int(os.getenv("RETRIEVAL_K_INITIAL", 10))
     SEARCH_TYPE: str         = os.getenv("SEARCH_TYPE", "similarity")
+    # RRF fusion weight for dense (FAISS/Qdrant) results; sparse (BM25) gets (1 - this).
+    # 0.5 = unweighted (today's default). Higher favors semantic matches, lower favors exact keywords.
+    RRF_DENSE_WEIGHT: float  = float(os.getenv("RRF_DENSE_WEIGHT", "0.5"))
 
     # --- LLM (local fallback) ---
     LLM_MODEL: str       = os.getenv("LLM_MODEL", "google/flan-t5-base")
