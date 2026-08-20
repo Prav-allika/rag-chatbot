@@ -154,14 +154,24 @@ def _ragas_llm():
     Native ragas LLM (InstructorBaseRagasLLM) for the app's configured provider.
     ragas 0.4.x's `metrics.collections` API requires this — it rejects the
     LangChain wrapper (LangchainLLMWrapper) used by older ragas versions.
+
+    OpenAI is checked first, matching get_llm()'s own priority (OpenAI >
+    Groq) — this used to check Groq first regardless of whether OpenAI was
+    also configured, which silently diverged from the rest of the app
+    whenever both keys were set. That divergence surfaced as a genuine
+    crash, not just an inconsistency: ragas's Groq path patches AsyncGroq
+    via `instructor`, and that patching failed against the installed groq
+    SDK ("'AsyncGroq' object has no attribute 'messages'") -- a real
+    incompatibility between ragas and groq's client internals, sidestepped
+    entirely by preferring the OpenAI path whenever it's available.
     """
     from ragas.llms import llm_factory
 
-    if Config.use_groq():
-        from groq import AsyncGroq
-        return llm_factory(Config.GROQ_MODEL, provider="groq", client=AsyncGroq(api_key=Config.GROQ_API_KEY))
-    from openai import AsyncOpenAI
-    return llm_factory(Config.OPENAI_MODEL, provider="openai", client=AsyncOpenAI(api_key=Config.OPENAI_API_KEY))
+    if Config.use_openai():
+        from openai import AsyncOpenAI
+        return llm_factory(Config.OPENAI_MODEL, provider="openai", client=AsyncOpenAI(api_key=Config.OPENAI_API_KEY))
+    from groq import AsyncGroq
+    return llm_factory(Config.GROQ_MODEL, provider="groq", client=AsyncGroq(api_key=Config.GROQ_API_KEY))
 
 
 def _ragas_embeddings():
