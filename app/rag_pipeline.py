@@ -36,6 +36,7 @@ from langchain_core.output_parsers import StrOutputParser
 
 from app.config import Config
 from app.guards import check_input_guard, redact_pii
+from app.citations import _REFUSAL_MESSAGE
 from app.document_loader import build_vector_store, load_vector_store, _SUPPORTED_EXTENSIONS
 from app.evaluation import (
     generate_retrieval_test_set,
@@ -549,6 +550,16 @@ def _parse_recent_history(history_text: str, n_turns: int = 2) -> str:
         if user_m and asst_m:
             q = user_m.group(1).strip()
             a = asst_m.group(1).strip()[:250]
+            if _REFUSAL_MESSAGE in a:
+                # A past refusal isn't useful "recent context" -- worse, feeding
+                # the model its own prior "not covered" answer back as apparent
+                # precedent biases it to repeat that refusal even when THIS
+                # turn's retrieved context clearly contains the answer.
+                # Observed directly: a question the loaded document answers
+                # verbatim, refused a second time only because the first
+                # refusal (from before a retrieval fix landed) was still
+                # sitting in conversation history.
+                continue
             pairs.append(f"User: {q}\nAssistant: {a}")
 
     if not pairs:

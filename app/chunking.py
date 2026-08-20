@@ -48,19 +48,40 @@ def _group_by_source(docs: list) -> dict:
     return groups
 
 
+_QA_START_RE = re.compile(r"^Q:\s")
+
+
 def _split_text_preserving_tables(text: str, chunk_size: int, sub_splitter) -> list:
     """
-    Splits text via sub_splitter, but keeps any "[TABLE]..." block (as produced
-    by document_loader._pdfplumber_table_text, one block per "\\n\\n"-separated
-    paragraph) atomic — never split mid-table. A table row or its row-group
-    label (e.g. "(C)") landing in a different chunk than the rest of its row
-    makes the numbers unreadable or misattributable — observed directly: a
-    4-row table truncated to 3 rows right before the row a question needed.
+    Splits text via sub_splitter, but keeps two structural units atomic —
+    never split mid-unit:
+
+      - "[TABLE]..." blocks (one per "\\n\\n"-separated paragraph, produced
+        by document_loader._pdfplumber_table_text). A table row or its
+        row-group label (e.g. "(C)") landing in a different chunk than the
+        rest of its row makes the numbers unreadable or misattributable —
+        observed directly: a 4-row table truncated to 3 rows right before
+        the row a question needed.
+
+      - FAQ-style "Q: <question>" paragraphs together with every paragraph
+        that follows, up to the next "Q:" (or "[TABLE]") paragraph — their
+        answer, which may itself span several "\\n\\n" paragraphs. Left to
+        plain character splitting, a long Q+A pair gets cut wherever
+        chunk_size runs out, which — since the question is short and the
+        answer is what's long — usually lands right between them: one
+        chunk ends up holding the question with no answer, another holds
+        the answer with no question, and retrieval ranks the question-only
+        chunk highest (it echoes the query) while the actual answer
+        surfaces as an apparently unrelated fragment. Observed directly:
+        a question asked verbatim against a document that answers it
+        verbatim, refused as "not covered" because retrieval had split
+        the pair apart before either half reached the LLM.
     """
     paragraphs = text.split("\n\n")
     out = []
     prose_buffer: list = []
-    table_size_cap = chunk_size * 4   # safety net against one pathologically huge table
+    qa_buffer: list = []
+    size_cap = chunk_size * 4   # safety net against one pathologically huge block
 
     def _flush_prose():
         if not prose_buffer:
@@ -70,19 +91,41 @@ def _split_text_preserving_tables(text: str, chunk_size: int, sub_splitter) -> l
         if joined.strip():
             out.extend(sub_splitter.split_text(joined))
 
+    def _flush_qa():
+        if not qa_buffer:
+            return
+        joined = "\n\n".join(qa_buffer)
+        qa_buffer.clear()
+        if not joined.strip():
+            return
+        if len(joined) > size_cap:
+            logger.warning(f"Q&A block ({len(joined)} chars) exceeds safety cap — splitting despite atomicity goal")
+            out.extend(sub_splitter.split_text(joined))
+        else:
+            out.append(joined.strip())
+
     for p in paragraphs:
-        if p.lstrip().startswith("[TABLE]"):
+        stripped = p.lstrip()
+        if stripped.startswith("[TABLE]"):
             _flush_prose()
+            _flush_qa()
             if not p.strip():
                 continue
-            if len(p) > table_size_cap:
+            if len(p) > size_cap:
                 logger.warning(f"Table block ({len(p)} chars) exceeds safety cap — splitting despite atomicity goal")
                 out.extend(sub_splitter.split_text(p))
             else:
                 out.append(p.strip())
+        elif _QA_START_RE.match(stripped):
+            _flush_prose()
+            _flush_qa()   # previous question's answer (if any) is complete -- flush it atomically
+            qa_buffer.append(p)
+        elif qa_buffer:
+            qa_buffer.append(p)   # continuation of the current question's answer
         else:
             prose_buffer.append(p)
     _flush_prose()
+    _flush_qa()
     return out
 
 
