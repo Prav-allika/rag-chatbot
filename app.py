@@ -809,13 +809,20 @@ button.stop:hover {
     box-shadow: 0 3px 10px rgba(227,154,123,0.2) !important;
 }
 
-/* ── Tabs ── */
-.tabs > .tab-nav {
+/* ── Tabs ──
+   `.tab-nav > button` doesn't exist in this Gradio version's DOM (verified
+   via getComputedStyle/matches() -- the real structure is
+   [role=tablist] > .tab-container > button[role=tab], no "tab-nav" class
+   anywhere), so that selector never matched and every unselected tab fell
+   through to Gradio's own default (var(--body-text-color), which resolves
+   to the neutral-hue's near-white shade here) -- functionally invisible.
+   ARIA role attributes are stable across Gradio versions; class names aren't. */
+.gradio-container [role="tablist"] {
     border-bottom: 2px solid #FFD3AC !important;
     background: transparent !important;
     margin-bottom: 16px !important;
 }
-.tabs > .tab-nav > button {
+.gradio-container [role="tablist"] button[role="tab"] {
     color: #A06030 !important;
     background: transparent !important;
     border: none !important;
@@ -827,11 +834,11 @@ button.stop:hover {
     transition: color 0.15s !important;
     margin-bottom: -2px !important;
 }
-.tabs > .tab-nav > button.selected {
+.gradio-container [role="tablist"] button[role="tab"][aria-selected="true"] {
     color: #E39A7B !important;
     border-bottom-color: #E39A7B !important;
 }
-.tabs > .tab-nav > button:hover { color: #DBB06B !important; }
+.gradio-container [role="tablist"] button[role="tab"]:hover { color: #DBB06B !important; }
 
 /* ── File upload ── */
 .upload-button-container > button {
