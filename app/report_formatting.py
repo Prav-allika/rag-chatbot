@@ -149,13 +149,19 @@ def format_answer_html(text: str) -> str:
 
 def format_bar_html(label: str, value_str: str, pct: float) -> str:
     """One labeled progress bar -- used for both the confidence breakdown
-    and the golden-eval per-category scorecard."""
+    and the golden-eval per-category scorecard.
+
+    Each span sets its own `color ... !important` rather than relying on
+    inheriting it from the parent div's color -- Gradio ships a universal
+    `.gradio-container * { color: ... !important }` reset that beats a
+    plain inherited value even though it doesn't beat an element's own
+    `!important` (same class of bug as the invisible tab-label fix)."""
     pct = min(max(pct, 0.0), 1.0)
     return f"""
     <div style="margin-bottom:14px;">
-      <div style="display:flex; justify-content:space-between; font-size:0.88em; color:#5A3010; margin-bottom:4px;">
-        <span style="font-weight:600; text-transform:capitalize;">{html.escape(label)}</span>
-        <span>{html.escape(value_str)}</span>
+      <div style="display:flex; justify-content:space-between; font-size:0.88em; margin-bottom:4px;">
+        <span style="font-weight:600; text-transform:capitalize; color:#5A3010 !important;">{html.escape(label)}</span>
+        <span style="color:#5A3010 !important;">{html.escape(value_str)}</span>
       </div>
       <div style="background:#FFE3CC; border-radius:8px; height:10px; overflow:hidden;">
         <div style="width:{pct * 100:.1f}%; height:100%; background:linear-gradient(90deg,#DBB06B,#E39A7B); border-radius:8px;"></div>
