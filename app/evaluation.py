@@ -164,12 +164,29 @@ def _ragas_llm():
     SDK ("'AsyncGroq' object has no attribute 'messages'") -- a real
     incompatibility between ragas and groq's client internals, sidestepped
     entirely by preferring the OpenAI path whenever it's available.
+
+    gpt-5.x models need the same reasoning_effort/max_tokens handling as
+    get_llm() (rag_pipeline.py) -- they spend max_tokens on hidden
+    reasoning before any visible output, and ragas's `instructor`-based
+    structured-output parsing has no budget left over: it raised
+    instructor.v2.core.errors.IncompleteOutputException ("output is
+    incomplete due to a max_tokens length limit") on every RAGAS call
+    once the Groq/instructor crash above was fixed and this path actually
+    started being exercised. reasoning_effort="minimal" avoids burning the
+    budget on reasoning, and a higher max_tokens leaves room for RAGAS's
+    multi-claim JSON output (longer than a typical chat answer).
     """
     from ragas.llms import llm_factory
 
     if Config.use_openai():
         from openai import AsyncOpenAI
-        return llm_factory(Config.OPENAI_MODEL, provider="openai", client=AsyncOpenAI(api_key=Config.OPENAI_API_KEY))
+        kwargs = {"max_tokens": max(Config.LLM_MAX_OUTPUT_TOKENS, 2000)}
+        if Config.OPENAI_MODEL.startswith("gpt-5"):
+            kwargs["reasoning_effort"] = "minimal"
+        return llm_factory(
+            Config.OPENAI_MODEL, provider="openai",
+            client=AsyncOpenAI(api_key=Config.OPENAI_API_KEY), **kwargs,
+        )
     from groq import AsyncGroq
     return llm_factory(Config.GROQ_MODEL, provider="groq", client=AsyncGroq(api_key=Config.GROQ_API_KEY))
 
