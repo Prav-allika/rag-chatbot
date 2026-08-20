@@ -502,8 +502,23 @@ def dense_only_retrieve(vector_store, query: str, k_initial: int = None, k_final
 # QUESTION CONDENSATION
 # =============================================================================
 def condense_question(question: str, history: str) -> str:
-    """Rewrite a follow-up question as a standalone question using chat history."""
-    template = """Given the conversation history and a follow-up question, rewrite the follow-up as a complete standalone question. If already standalone, return it unchanged.
+    """Rewrite a follow-up question as a standalone question using chat history.
+
+    The prompt below explicitly forbids pulling in unrelated history details --
+    observed directly, without that guard, gpt-5-mini would "condense" an
+    already-standalone new question by stuffing it with unrelated facts from
+    the previous answer (e.g. "What is the title of this paper?", right after
+    a question about N/d_model/h, became "What is the title of the paper that
+    uses N = 6, d_model = 512, and h = 8 for the base Transformer model?").
+    That version embeds nowhere near the paper's actual title/byline text, so
+    retrieval scored it INCORRECT (best=-7.32) and the question was refused --
+    even though the original, unmodified question retrieves and answers fine.
+    """
+    template = """Given the conversation history and a follow-up question, decide whether the follow-up question can already stand on its own.
+
+If the follow-up question names its own subject and does not rely on a pronoun or reference ("it", "that", "this", "those", "the previous one", etc.) to be understood, it is ALREADY standalone: return it back EXACTLY UNCHANGED, character for character. Do NOT add, rephrase, or pull in any facts, numbers, or details from the history, even if they seem related to the same document -- an already-standalone question must not be modified at all.
+
+Only if the follow-up genuinely cannot be understood without the history (because of a pronoun or missing reference) should you rewrite it -- and then resolve ONLY that missing reference, using the minimum necessary words. Do not add any other detail from the history.
 
 Conversation history:
 {history}
@@ -831,7 +846,21 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                     "cached_tokens": _extract_cached_tokens(raw_result),
                     "confidence": compute_confidence(result, graded_docs, grade, sub_query_count),
                 }
-                self._cache.store(question, {k: v for k, v in payload.items() if k != "cache_hit"})
+                if _REFUSAL_MESSAGE not in result:
+                    # CRAG grading said the retrieval was fine, but the LLM chose
+                    # to refuse anyway (a generation-time judgment call, not a
+                    # stable fact about the document) -- caching it would replay
+                    # that one bad call as gospel for every future question close
+                    # enough in embedding space, for every session, until the
+                    # 24h TTL/eviction. Observed directly: a single early false
+                    # refusal for "What is layer normalization used for?" got
+                    # cached and then silently answered every later ask of that
+                    # question -- across brand-new browser sessions and even
+                    # after "Clear Conversation" (which only clears the history
+                    # transcript, a separate store from this answer cache) --
+                    # with the same stale refusal, long after the document and
+                    # retrieval were both fine.
+                    self._cache.store(question, {k: v for k, v in payload.items() if k != "cache_hit"})
                 return payload
 
             # ----------------------------------------------------------------
@@ -947,13 +976,16 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                 cached_tokens = _extract_cached_tokens(accumulated_msg)
                 confidence = compute_confidence(full_answer, graded_docs, grade, sub_query_count)
 
-                self._cache.store(question, {
-                    "result": full_answer,
-                    "sources": sources,
-                    "grade": grade,
-                    "query_type": query_type,
-                    "confidence": confidence,
-                })
+                if _REFUSAL_MESSAGE not in full_answer:
+                    # See the matching guard in invoke() -- an LLM-generated
+                    # refusal despite CORRECT grading must not be memoized.
+                    self._cache.store(question, {
+                        "result": full_answer,
+                        "sources": sources,
+                        "grade": grade,
+                        "query_type": query_type,
+                        "confidence": confidence,
+                    })
 
                 yield {
                     "chunk": "",
