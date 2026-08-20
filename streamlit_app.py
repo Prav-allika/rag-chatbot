@@ -19,12 +19,27 @@ import json
 import os
 import re
 import tempfile
+from datetime import datetime
 
 import streamlit as st
 
 from app.config import Config
 from app.document_loader import _SUPPORTED_EXTENSIONS
 from app.rag_pipeline import build_vector_store, load_vector_store, make_qa_chain, dense_only_retrieve
+from app.citations import verify_citations
+from app.evaluation import evaluate_rag_response
+from app.session_store import (
+    save_history,
+    load_history,
+    delete_history,
+    save_feedback,
+    get_feedback_stats,
+)
+from app.report_formatting import (
+    format_retrieval_eval,
+    format_ragas_eval,
+    format_citation_verification,
+)
 
 STORE_PATH = "artifacts/vector_store"
 DOC_ID = "Attention.pdf"
@@ -42,6 +57,7 @@ _ICONS = {
     "layers": f'<svg {_ICON_ATTRS}><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>',
     "target": f'<svg {_ICON_ATTRS}><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
     "grid": f'<svg {_ICON_ATTRS}><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
+    "thumbsup": f'<svg {_ICON_ATTRS}><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg>',
 }
 
 st.set_page_config(page_title="RAG Pipeline Dashboard", layout="wide")
@@ -87,7 +103,7 @@ html, body, [class*="css"] { font-family: 'Plus Jakarta Sans', -apple-system, sa
     text-shadow: 0 2px 8px rgba(100,40,10,0.18);
 }
 .app-header p {
-    color: rgba(255,255,255,0.9);
+    color: rgba(255,255,255,0.88);
     font-size: 0.92em;
     margin: 0;
     letter-spacing: 0.01em;
@@ -109,6 +125,24 @@ html, body, [class*="css"] { font-family: 'Plus Jakarta Sans', -apple-system, sa
     box-shadow: 0 2px 8px rgba(227,154,123,0.22);
 }
 .section-label svg { flex-shrink: 0; }
+
+/* Field-level labels (document/question/history/eval boxes) -- same red
+   Gradio's default component labels render in (#EA580C, Tailwind orange-600),
+   left unstyled there since it was never overridden -- kept deliberate here
+   so the two surfaces read as the same product at this smaller label tier
+   too, distinct from the bigger gradient .section-label pills above. */
+.field-label {
+    display: inline-block;
+    background: #EA580C;
+    color: #FFFFFF;
+    font-size: 0.68em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    border-radius: 6px;
+    padding: 4px 10px;
+    margin: 0 0 8px 0;
+}
 
 /* Cards */
 [data-testid="stVerticalBlockBorderWrapper"] {
@@ -308,6 +342,10 @@ def _section_label(text: str, icon: str = None):
     st.markdown(f'<div class="section-label">{icon_html}{text}</div>', unsafe_allow_html=True)
 
 
+def _field_label(text: str):
+    st.markdown(f'<div class="field-label">{text}</div>', unsafe_allow_html=True)
+
+
 def _bar_row(label: str, correct: int, total: int):
     pct = (correct / total) if total else 0.0
     st.markdown(
@@ -461,8 +499,32 @@ def render_ask_tab():
     vs = st.session_state.loaded_docs[active_doc]["vs"]
     chain = st.session_state.loaded_docs[active_doc]["chain"]
 
+    if "history_by_doc" not in st.session_state:
+        st.session_state.history_by_doc = {}
+    if active_doc not in st.session_state.history_by_doc:
+        # Restored once per doc per session -- Redis-backed, shared with the
+        # Gradio app's own history for the same doc name (app/session_store.py).
+        st.session_state.history_by_doc[active_doc] = load_history(active_doc)
+
     st.write("")
     _section_label("STEP 2 — ASK", "message")
+
+    _field_label("CONVERSATION HISTORY")
+    history_text = st.session_state.history_by_doc.get(active_doc, "")
+    with st.container(border=True):
+        if history_text:
+            st.markdown(
+                f'<div class="snippet" style="white-space:pre-wrap;">{html.escape(history_text)}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption("No conversation yet.")
+    if st.button("Clear Conversation", key="clear_history_btn"):
+        st.session_state.history_by_doc[active_doc] = ""
+        delete_history(active_doc)
+        st.rerun()
+
+    st.write("")
     question = st.text_input("Question", label_visibility="collapsed", placeholder="Ask a question about the active document...")
     st.caption("Calls the configured LLM once per question (real API cost, same as normal use).")
     ask = st.button("Ask", type="primary", icon=":material/send:")
@@ -471,11 +533,34 @@ def render_ask_tab():
         with st.spinner("Retrieving and generating..."):
             result = chain.invoke({"query": question})
             dense_docs, dense_grade = dense_only_retrieve(vs, question)
+        answer_text = result.get("result", "")
+        sources_for_eval = result.get("sources") or []
+
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        separator = ". " * 30
+        new_entry = f"[{timestamp}]  You: {question}\n\nAssistant: {answer_text}\n\n{separator}\n\n"
+        updated_history = st.session_state.history_by_doc.get(active_doc, "") + new_entry
+        st.session_state.history_by_doc[active_doc] = updated_history
+        save_history(active_doc, updated_history)
+
         st.session_state["last_result"] = result
         st.session_state["last_dense_docs"] = dense_docs
         st.session_state["last_dense_grade"] = dense_grade
         st.session_state["selected_source"] = None
         st.session_state["last_answered_doc"] = active_doc
+
+        st.session_state["last_eval_question"] = question
+        st.session_state["last_eval_answer"] = answer_text
+        st.session_state["last_eval_contexts"] = [s.get("content", "") for s in sources_for_eval]
+        st.session_state["last_eval_sources"] = sources_for_eval
+        st.session_state["feedback_status"] = ""
+        st.session_state["phase1_report"] = ""
+        st.session_state["phase2_report"] = ""
+        st.session_state["phase4_report"] = ""
+        # The CONVERSATION HISTORY box above was already drawn this pass with
+        # the pre-answer text -- only a rerun redraws it with this entry included
+        # (same reasoning as the Source-button highlight fix elsewhere in this file).
+        st.rerun()
 
     if st.session_state.get("last_answered_doc") != active_doc:
         # Switched documents since the last answer -- don't show a stale answer
@@ -522,6 +607,88 @@ def render_ask_tab():
         st.write("")
         _section_label("RETRIEVAL COMPARISON — HYBRID VS. DENSE-ONLY", "layers")
         render_comparison(sources, dense_docs)
+
+    st.write("")
+    _section_label("RATE THE LAST ANSWER", "thumbsup")
+    fb_col1, fb_col2, fb_col3 = st.columns([1, 1, 4])
+    with fb_col1:
+        if st.button("Thumbs Up", key="thumbs_up_btn", use_container_width=True):
+            save_feedback(active_doc, st.session_state.get("last_eval_question", ""), st.session_state.get("last_eval_answer", ""), "up")
+            fb = get_feedback_stats(active_doc)
+            st.session_state["feedback_status"] = f"Recorded: thumbs up  ({fb['up']} up / {fb['down']} down total)"
+    with fb_col2:
+        if st.button("Thumbs Down", key="thumbs_down_btn", use_container_width=True):
+            save_feedback(active_doc, st.session_state.get("last_eval_question", ""), st.session_state.get("last_eval_answer", ""), "down")
+            fb = get_feedback_stats(active_doc)
+            st.session_state["feedback_status"] = f"Recorded: thumbs down  ({fb['up']} up / {fb['down']} down total)"
+    with fb_col3:
+        _field_label("FEEDBACK STATUS")
+        st.write(st.session_state.get("feedback_status") or " ")
+
+    st.write("")
+    _section_label("STEP 3 — EVALUATION", "grid")
+    eval_tab1, eval_tab2, eval_tab3 = st.tabs(
+        ["Phase 1 — Retrieval Eval", "Phase 2 — RAGAS Eval", "Phase 4 — Citation Verification"]
+    )
+
+    with eval_tab1:
+        st.markdown(
+            "Generates synthetic questions from document chunks — measures "
+            "**Precision@K · Recall@K · MRR · Coverage**.  \n"
+            "Takes ~20 seconds. No extra API keys needed."
+        )
+        if st.button("Run Retrieval Evaluation", key="phase1_btn"):
+            if not hasattr(chain, "run_retrieval_eval"):
+                st.session_state["phase1_report"] = "Retrieval eval not available on this chain."
+            else:
+                with st.spinner("Generating synthetic questions and scoring retrieval..."):
+                    eval_result = chain.run_retrieval_eval(n_questions=8, k=Config.RETRIEVAL_K)
+                st.session_state["phase1_report"] = format_retrieval_eval(eval_result, active_doc)
+        if st.session_state.get("phase1_report"):
+            _field_label("RETRIEVAL METRICS")
+            st.code(st.session_state["phase1_report"], language=None)
+
+    with eval_tab2:
+        st.markdown(
+            "Scores the last answer on **Faithfulness · Answer Relevancy · Context Precision** "
+            "via LLM-as-judge.  \nRequires `RAGAS_EVAL=true` in `.env`. Uses your configured Groq "
+            "LLM — takes 10-20 seconds."
+        )
+        if st.button("Evaluate Last Answer (RAGAS)", key="phase2_btn"):
+            q = st.session_state.get("last_eval_question", "")
+            if not q:
+                st.session_state["phase2_report"] = "Ask a question first, then click Evaluate."
+            else:
+                a = st.session_state.get("last_eval_answer", "")
+                ctxs = st.session_state.get("last_eval_contexts", [])
+                with st.spinner("Running RAGAS evaluation..."):
+                    scores = evaluate_rag_response(q, a, ctxs)
+                st.session_state["phase2_report"] = format_ragas_eval(scores, q)
+        if st.session_state.get("phase2_report"):
+            _field_label("RAGAS SCORES")
+            st.code(st.session_state["phase2_report"], language=None)
+
+    with eval_tab3:
+        st.markdown(
+            "Checks whether each cited superscript (¹²³) in the last answer is actually "
+            "supported by the source chunk it points to, and flags claims with no citation at all.  \n"
+            "Uses your configured LLM — one extra call per cited sentence, takes a few seconds."
+        )
+        if st.button("Verify Citations (Last Answer)", key="phase4_btn"):
+            q = st.session_state.get("last_eval_question", "")
+            srcs = st.session_state.get("last_eval_sources", [])
+            if not q:
+                st.session_state["phase4_report"] = "Ask a question first, then click Verify."
+            elif not srcs:
+                st.session_state["phase4_report"] = "No source chunks were returned for the last answer — nothing to verify."
+            else:
+                a = st.session_state.get("last_eval_answer", "")
+                with st.spinner("Verifying citations..."):
+                    citation_result = verify_citations(a, srcs)
+                st.session_state["phase4_report"] = format_citation_verification(citation_result, q)
+        if st.session_state.get("phase4_report"):
+            _field_label("CITATION VERIFICATION")
+            st.code(st.session_state["phase4_report"], language=None)
 
 
 def render_golden_tab():

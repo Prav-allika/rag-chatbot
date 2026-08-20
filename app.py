@@ -15,7 +15,6 @@ logging.basicConfig(
 import gradio as gr  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
-import json  # noqa: E402
 import time  # noqa: E402
 import tempfile  # noqa: E402
 from datetime import datetime  # noqa: E402
@@ -29,113 +28,18 @@ from app.rag_pipeline import (  # noqa: E402
     Config,
 )
 from app.citations import verify_citations  # noqa: E402
-
-# ---------- Redis conversation history ----------
-_redis_client = None
-_HISTORY_TTL = 60 * 60 * 24 * 7   # 7 days
-_history_mem: dict = {}            # in-memory fallback when Redis unavailable
-
-
-def _get_redis():
-    global _redis_client
-    if _redis_client is None:
-        try:
-            import redis
-            c = redis.from_url(Config.REDIS_URL, decode_responses=True)
-            c.ping()
-            _redis_client = c
-        except Exception:
-            _redis_client = False   # mark as unavailable so we don't retry
-    return _redis_client if _redis_client else None
-
-
-def _history_key(doc_name: str) -> str:
-    return f"rag:history:{doc_name}"
-
-
-def _save_history(doc_name: str, history_text: str) -> None:
-    client = _get_redis()
-    if client and doc_name:
-        try:
-            client.setex(_history_key(doc_name), _HISTORY_TTL, history_text)
-            return
-        except Exception:
-            pass
-    if doc_name:
-        _history_mem[doc_name] = history_text
-
-
-def _load_history(doc_name: str) -> str:
-    client = _get_redis()
-    if client and doc_name:
-        try:
-            return client.get(_history_key(doc_name)) or ""
-        except Exception:
-            pass
-    return _history_mem.get(doc_name, "")
-
-
-def _delete_history(doc_name: str) -> None:
-    client = _get_redis()
-    if client and doc_name:
-        try:
-            client.delete(_history_key(doc_name))
-        except Exception:
-            pass
-    _history_mem.pop(doc_name, None)
-
-
-# ---------- Phase 3 — Human Feedback (Redis-backed + in-memory fallback) ----------
-_feedback_mem: dict = {}   # {doc_name: [{"rating": "up"/"down", "q": ..., "a": ...}]}
-
-
-def _feedback_key(doc_name: str) -> str:
-    return f"rag:feedback:{doc_name}"
-
-
-def _save_feedback(doc_name: str, question: str, answer: str, rating: str) -> None:
-    """Store one thumbs-up/down record. Redis list when available, else in-memory."""
-    entry_dict = {
-        "q": question[:120],
-        "a": answer[:120],
-        "rating": rating,
-        "ts": datetime.now().isoformat(),
-    }
-    client = _get_redis()
-    if client and doc_name:
-        try:
-            key = _feedback_key(doc_name)
-            client.rpush(key, json.dumps(entry_dict))
-            client.expire(key, 60 * 60 * 24 * 30)
-            return
-        except Exception:
-            pass
-    # In-memory fallback
-    if doc_name:
-        _feedback_mem.setdefault(doc_name, []).append(entry_dict)
-
-
-def _get_feedback_stats(doc_name: str) -> dict:
-    if not doc_name:
-        return {"total": 0, "up": 0, "down": 0, "rate": None}
-
-    client = _get_redis()
-    if client:
-        try:
-            entries = [json.loads(e) for e in client.lrange(_feedback_key(doc_name), 0, -1)]
-        except Exception:
-            entries = _feedback_mem.get(doc_name, [])
-    else:
-        entries = _feedback_mem.get(doc_name, [])
-
-    total = len(entries)
-    up = sum(1 for e in entries if e.get("rating") == "up")
-    return {
-        "total": total,
-        "up": up,
-        "down": total - up,
-        "rate": round(up / total * 100, 1) if total else None,
-    }
+from app.session_store import (  # noqa: E402
+    save_history as _save_history,
+    load_history as _load_history,
+    delete_history as _delete_history,
+    save_feedback as _save_feedback,
+    get_feedback_stats as _get_feedback_stats,
+)
+from app.report_formatting import (  # noqa: E402
+    format_retrieval_eval,
+    format_ragas_eval,
+    format_citation_verification,
+)
 
 
 def strip_emojis(text):
@@ -412,36 +316,7 @@ def run_phase1_eval():
         return "Retrieval eval not available on this chain."
 
     result = chain.run_retrieval_eval(n_questions=8, k=Config.RETRIEVAL_K)
-
-    if "error" in result:
-        return f"Evaluation error: {result['error']}"
-
-    k = result.get("k", Config.RETRIEVAL_K)
-    n = result.get("n_questions", 0)
-    sep = "-" * 56
-    _INTERPRET = {
-        "precision_at_k": f"of {k} retrieved chunks, how many contained the answer",
-        "recall_at_k":    f"was the source chunk found anywhere in top {k}?",
-        "mrr":            "1/rank of first relevant result — higher = answer ranked earlier",
-        "coverage":       "% of questions where at least 1 relevant chunk was found",
-    }
-    lines = [
-        f"Phase 1 — Retrieval Evaluation  ({n} synthetic questions, K={k})",
-        sep,
-        f"Document: {current_doc_name}",
-        sep,
-    ]
-    for key in ["precision_at_k", "recall_at_k", "mrr", "coverage"]:
-        score = result.get(key, 0.0)
-        bar = "#" * int(score * 20)
-        label = key.replace("_", " ").replace("at k", f"@{k}").title().ljust(18)
-        lines.append(f"{label}  {score:.3f}  [{bar:<20}]  {_INTERPRET[key]}")
-    lines += [
-        sep,
-        "Score: 0.0 = poor   0.5 = acceptable   1.0 = perfect",
-        "Synthetic test set — questions auto-generated by LLM from document chunks.",
-    ]
-    return "\n".join(lines)
+    return format_retrieval_eval(result, current_doc_name)
 
 
 def thumbs_up():
@@ -474,43 +349,7 @@ def run_evaluation():
         return "Ask a question first, then click Evaluate."
 
     scores = evaluate_rag_response(q, a, ctxs)
-
-    if "info" in scores:
-        return scores["info"]
-    if "error" in scores:
-        return f"Evaluation error: {scores['error']}"
-
-    _LABELS = {
-        "faithfulness": "Faithfulness        ",
-        "answer_relevancy": "Answer Relevancy    ",
-        "context_precision": "Context Precision   ",
-        "llm_context_precision_without_reference": "Context Precision   ",
-    }
-    _INTERPRET = {
-        "faithfulness": "answer is grounded in source chunks (hallucination check)",
-        "answer_relevancy": "answer addresses the question asked",
-        "context_precision": "retrieved chunks are relevant to the query",
-        "llm_context_precision_without_reference": "retrieved chunks are relevant to the query",
-    }
-
-    sep = "-" * 56
-    lines = [
-        "RAGAS Evaluation  (LLM-judged via Groq)",
-        sep,
-        f"Question: {q[:80]}{'...' if len(q) > 80 else ''}",
-        sep,
-    ]
-    for key, score in scores.items():
-        label = _LABELS.get(key, key.ljust(20))
-        interp = _INTERPRET.get(key, "")
-        bar = "#" * int(score * 20)
-        lines.append(f"{label}  {score:.3f}  [{bar:<20}]  {interp}")
-
-    lines += [
-        sep,
-        "Score: 0.0 = poor   0.5 = acceptable   1.0 = perfect",
-    ]
-    return "\n".join(lines)
+    return format_ragas_eval(scores, q)
 
 
 def run_citation_verification():
@@ -530,41 +369,7 @@ def run_citation_verification():
         return "No source chunks were returned for the last answer — nothing to verify."
 
     result = verify_citations(a, sources)
-    citations = result["citations"]
-    uncited = result["uncited_sentences"]
-
-    sep = "-" * 56
-    lines = [
-        "Citation Verification  (LLM-judged, one call per cited sentence)",
-        sep,
-        f"Question: {q[:80]}{'...' if len(q) > 80 else ''}",
-        sep,
-    ]
-
-    cov_bar = "#" * int(result["coverage"] * 20)
-    acc_bar = "#" * int(result["accuracy"] * 20)
-    lines.append(f"Coverage   {result['coverage']:.3f}  [{cov_bar:<20}]  claims with a citation attached")
-    lines.append(f"Accuracy   {result['accuracy']:.3f}  [{acc_bar:<20}]  citations actually supported by their source")
-
-    unsupported = [c for c in citations if not c["supported"]]
-    if unsupported:
-        lines += [sep, f"UNSUPPORTED CITATIONS ({len(unsupported)}):"]
-        for c in unsupported[:5]:
-            src = ", ".join(str(n) for n in c["cited_sources"])
-            lines.append(f"  [{src}] \"{c['sentence'][:100]}\"")
-            lines.append(f"        -> {c['reason']}")
-        if len(unsupported) > 5:
-            lines.append(f"  ... and {len(unsupported) - 5} more")
-    elif citations:
-        lines += [sep, "All cited claims were supported by their source chunk."]
-
-    if uncited:
-        lines += [sep, f"UNCITED CLAIMS ({len(uncited)}) — stated without a source number:"]
-        for s in uncited[:5]:
-            lines.append(f"  \"{s[:100]}\"")
-
-    lines += [sep, "0.0 = poor   1.0 = perfect"]
-    return "\n".join(lines)
+    return format_citation_verification(result, q)
 
 
 # ---------- UI — Theme & CSS ----------
