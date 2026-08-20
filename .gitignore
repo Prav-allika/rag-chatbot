@@ -8,16 +8,19 @@ __pycache__/
 # Environment
 .env
 
-# Artifacts
-#artifacts/
+# Artifacts — vector stores etc. are local build output, but the golden
+# eval test set + results are checked in so the Golden Set tab (app.py,
+# streamlit_app.py) has real data on a fresh clone / deploy, not just
+# on whichever machine last ran run_golden_eval.py.
+artifacts/*
+!artifacts/eval
+artifacts/eval/*
+!artifacts/eval/golden_testset.json
+!artifacts/eval/golden_eval_results.jsonl
 
 # IDE
 .vscode/
 .idea/
 *.DS_Store
-.env
-__pycache__/
-artifacts/
-*.pyc
-artifacts/
+
 data/*.pdf

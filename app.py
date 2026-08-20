@@ -816,7 +816,7 @@ button.stop:hover {
     margin-bottom: 16px !important;
 }
 .tabs > .tab-nav > button {
-    color: #C8A080 !important;
+    color: #A06030 !important;
     background: transparent !important;
     border: none !important;
     border-bottom: 3px solid transparent !important;

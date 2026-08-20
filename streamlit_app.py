@@ -201,7 +201,7 @@ html, body, [class*="css"] { font-family: 'Plus Jakarta Sans', -apple-system, sa
 /* Tabs */
 .stTabs [data-baseweb="tab-list"] { border-bottom: 2px solid #FFD3AC; gap: 4px; }
 .stTabs [data-baseweb="tab"] {
-    color: #C8A080;
+    color: #A06030;
     font-weight: 600;
     font-size: 0.94em;
     padding: 10px 20px;
