@@ -237,10 +237,16 @@ def evaluate_rag_response(question: str, answer: str, contexts: list) -> dict:
         scores = asyncio.run(_run())
         return {k: round(float(v), 3) for k, v in scores.items()}
 
-    except ImportError:
-        return {"error": "Run: pip install ragas datasets"}
-    except AttributeError:
-        pass  # collections API unavailable on this ragas version — fall through
+    except ImportError as e:
+        # Catches "ragas isn't installed at all" AND "ragas is installed but
+        # some submodule/transitive import inside it failed" -- those are very
+        # different problems, and reporting both as "pip install ragas
+        # datasets" hides a real version/environment issue behind a misleading
+        # fix. Log + surface the actual exception instead of guessing.
+        logger.warning(f"RAGAS collections-API import failed: {e!r}")
+        return {"error": f"RAGAS import failed ({e}). Run: pip install -U ragas datasets"}
+    except AttributeError as e:
+        logger.info(f"RAGAS collections API unavailable on this version ({e!r}) — falling back to legacy API")
 
     # RAGAS 0.1.x fallback (LangChain-wrapper API, older ragas versions)
     try:
