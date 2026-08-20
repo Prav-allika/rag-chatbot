@@ -1,11 +1,16 @@
 """
 app/report_formatting.py — plain-text report formatting for the three
-evaluation phases (retrieval eval, RAGAS, citation verification).
+evaluation phases (retrieval eval, RAGAS, citation verification), plus HTML
+fragments for the answer card, confidence/category bars, source detail, and
+hybrid-vs-dense-only comparison.
 
 Shared by app.py (Gradio) and streamlit_app.py so both UIs render the
-identical report for the identical underlying result, instead of each
-maintaining its own formatting that can drift out of sync.
+identical output for the identical underlying result, instead of each
+maintaining its own formatting/markup that can drift out of sync.
 """
+
+import html
+import re
 
 _SEP = "-" * 56
 
@@ -114,3 +119,88 @@ def format_citation_verification(result: dict, question: str) -> str:
 
     lines += [_SEP, "0.0 = poor   1.0 = perfect"]
     return "\n".join(lines)
+
+
+# =============================================================================
+# HTML fragments — answer card, bars, source detail, comparison panels
+# =============================================================================
+_SUPERSCRIPT_RUN = re.compile(r"[⁰¹²³⁴-⁹]+")
+
+
+def format_answer_html(text: str) -> str:
+    """Escapes the answer text, highlights citation superscripts (¹²³) as
+    styled '.cite' spans, and sets off an "Analogy:" line (if present) with
+    the '.analogy' class -- same convention the prompt uses
+    (rag_pipeline.py:_QUERY_PROMPTS). Caller wraps the result in a
+    '.answer-card' container."""
+    paragraphs = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        escaped = html.escape(line)
+        escaped = _SUPERSCRIPT_RUN.sub(lambda m: f'<span class="cite">{m.group(0)}</span>', escaped)
+        if line.startswith("Analogy:"):
+            paragraphs.append(f'<span class="analogy">{escaped}</span>')
+        else:
+            paragraphs.append(f"<p>{escaped}</p>")
+    return "\n".join(paragraphs)
+
+
+def format_bar_html(label: str, value_str: str, pct: float) -> str:
+    """One labeled progress bar -- used for both the confidence breakdown
+    and the golden-eval per-category scorecard."""
+    pct = min(max(pct, 0.0), 1.0)
+    return f"""
+    <div style="margin-bottom:14px;">
+      <div style="display:flex; justify-content:space-between; font-size:0.88em; color:#5A3010; margin-bottom:4px;">
+        <span style="font-weight:600; text-transform:capitalize;">{html.escape(label)}</span>
+        <span>{html.escape(value_str)}</span>
+      </div>
+      <div style="background:#FFE3CC; border-radius:8px; height:10px; overflow:hidden;">
+        <div style="width:{pct * 100:.1f}%; height:100%; background:linear-gradient(90deg,#DBB06B,#E39A7B); border-radius:8px;"></div>
+      </div>
+    </div>
+    """
+
+
+def _snippet_key(text: str) -> str:
+    return text[:80]
+
+
+def format_source_detail_html(source: dict) -> str:
+    """The '.meta-line' + '.snippet' block for one selected source chunk."""
+    content = html.escape(source.get("full_content", source.get("content", "")))
+    return (
+        f'<div class="meta-line">SOURCE {source.get("chunk")} &middot; PAGE {source.get("page", "N/A")} '
+        f'&middot; RERANK SCORE {source.get("score", "N/A")}</div>'
+        f'<div class="snippet">{content}</div>'
+    )
+
+
+def format_comparison_html(hybrid_sources: list, dense_docs: list) -> tuple:
+    """Returns (hybrid_html, dense_html) -- the two side-by-side retrieval
+    comparison panels. dense_docs are langchain Document objects, as
+    returned by rag_pipeline.dense_only_retrieve()."""
+    hybrid_keys = {_snippet_key(s.get("full_content", s.get("content", ""))) for s in hybrid_sources}
+    dense_keys = {_snippet_key(d.metadata.get("original_content", d.page_content)) for d in dense_docs}
+
+    hybrid_parts = []
+    for s in hybrid_sources:
+        content = s.get("full_content", s.get("content", ""))
+        overlap = " &middot; ALSO IN DENSE-ONLY" if _snippet_key(content) in dense_keys else ""
+        hybrid_parts.append(
+            f'<div class="meta-line">PAGE {s.get("page", "N/A")} &middot; SCORE {s.get("score", "N/A")}{overlap}</div>'
+            f'<div class="snippet">{html.escape(content[:220])}</div><div style="height:12px"></div>'
+        )
+
+    dense_parts = []
+    for d in dense_docs:
+        content = d.metadata.get("original_content", d.page_content)
+        overlap = " &middot; ALSO IN HYBRID" if _snippet_key(content) in hybrid_keys else ""
+        dense_parts.append(
+            f'<div class="meta-line">PAGE {d.metadata.get("page", "N/A")} &middot; SCORE {d.metadata.get("rerank_score", "N/A")}{overlap}</div>'
+            f'<div class="snippet">{html.escape(content[:220])}</div><div style="height:12px"></div>'
+        )
+
+    return "".join(hybrid_parts), "".join(dense_parts)

@@ -15,9 +15,7 @@ and "Golden Set" (the 50-question eval results). Run with:
 """
 
 import html
-import json
 import os
-import re
 import tempfile
 from datetime import datetime
 
@@ -39,7 +37,12 @@ from app.report_formatting import (
     format_retrieval_eval,
     format_ragas_eval,
     format_citation_verification,
+    format_answer_html,
+    format_bar_html,
+    format_source_detail_html,
+    format_comparison_html,
 )
+from app.golden_eval_summary import load_golden_eval_summary as _load_golden_eval_summary
 
 STORE_PATH = "artifacts/vector_store"
 DOC_ID = "Attention.pdf"
@@ -303,38 +306,7 @@ def ingest_uploaded_file(uploaded_file) -> str:
 
 @st.cache_data
 def load_golden_eval_summary():
-    """Reads the most recent full (50-question) golden eval run and returns
-    a per-category correctness breakdown, or None if no full run is recorded."""
-    if not os.path.exists(GOLDEN_RESULTS_PATH):
-        return None
-    latest_full_run = None
-    with open(GOLDEN_RESULTS_PATH) as f:
-        for line in f:
-            run = json.loads(line)
-            if run.get("n_questions") == 50:
-                latest_full_run = run
-    if latest_full_run is None:
-        return None
-
-    by_category = {}
-    for r in latest_full_run["results"]:
-        cat = r["category"]
-        by_category.setdefault(cat, [0, 0])
-        by_category[cat][1] += 1
-        if r["correct"]:
-            by_category[cat][0] += 1
-
-    total_correct = sum(c for c, _ in by_category.values())
-    total_n = sum(n for _, n in by_category.values())
-    return {
-        "timestamp": latest_full_run["timestamp"],
-        "by_category": by_category,
-        "overall": (total_correct, total_n),
-    }
-
-
-def _snippet_key(text: str) -> str:
-    return text[:80]
+    return _load_golden_eval_summary(GOLDEN_RESULTS_PATH)
 
 
 def _section_label(text: str, icon: str = None):
@@ -348,41 +320,7 @@ def _field_label(text: str):
 
 def _bar_row(label: str, correct: int, total: int):
     pct = (correct / total) if total else 0.0
-    st.markdown(
-        f"""
-        <div style="margin-bottom:14px;">
-          <div style="display:flex; justify-content:space-between; font-size:0.88em; color:#5A3010; margin-bottom:4px;">
-            <span style="font-weight:600; text-transform:capitalize;">{label}</span>
-            <span>{correct}/{total} &middot; {pct:.0%}</span>
-          </div>
-          <div style="background:#FFE3CC; border-radius:8px; height:10px; overflow:hidden;">
-            <div style="width:{pct*100:.1f}%; height:100%; background:linear-gradient(90deg,#DBB06B,#E39A7B); border-radius:8px;"></div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-_SUPERSCRIPT_RUN = re.compile(r"[⁰¹²³⁴-⁹]+")
-
-
-def _format_answer_html(text: str) -> str:
-    """Escapes the answer text, highlights citation superscripts (¹²³) as
-    styled spans, and sets off the "Analogy:" line (if present) distinctly --
-    same convention the prompt uses (rag_pipeline.py:_QUERY_PROMPTS)."""
-    paragraphs = []
-    for line in text.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        escaped = html.escape(line)
-        escaped = _SUPERSCRIPT_RUN.sub(lambda m: f'<span class="cite">{m.group(0)}</span>', escaped)
-        if line.startswith("Analogy:"):
-            paragraphs.append(f'<span class="analogy">{escaped}</span>')
-        else:
-            paragraphs.append(f"<p>{escaped}</p>")
-    return "\n".join(paragraphs)
+    st.markdown(format_bar_html(label, f"{correct}/{total} · {pct:.0%}", pct), unsafe_allow_html=True)
 
 
 def render_sources_panel(sources: list, selected_key: str):
@@ -409,44 +347,22 @@ def render_sources_panel(sources: list, selected_key: str):
         match = next((s for s in sources if s["chunk"] == active), None)
         if match:
             with st.container(border=True):
-                st.markdown(
-                    f'<div class="meta-line">SOURCE {active} &middot; PAGE {match.get("page", "N/A")} '
-                    f'&middot; RERANK SCORE {match.get("score", "N/A")}</div>',
-                    unsafe_allow_html=True,
-                )
-                content = html.escape(match.get("full_content", match.get("content", "")))
-                st.markdown(f'<div class="snippet">{content}</div>', unsafe_allow_html=True)
+                st.markdown(format_source_detail_html(match), unsafe_allow_html=True)
 
 
 def render_comparison(hybrid_sources: list, dense_docs: list):
-    hybrid_keys = {_snippet_key(s.get("full_content", s.get("content", ""))) for s in hybrid_sources}
-    dense_keys = {_snippet_key(d.metadata.get("original_content", d.page_content)) for d in dense_docs}
-
+    hybrid_html, dense_html = format_comparison_html(hybrid_sources, dense_docs)
     col_a, col_b = st.columns(2)
 
     with col_a:
         with st.container(border=True):
             st.markdown("**Hybrid** (BM25 + dense, RRF-fused)")
-            for s in hybrid_sources:
-                content = s.get("full_content", s.get("content", ""))
-                overlap = " &middot; ALSO IN DENSE-ONLY" if _snippet_key(content) in dense_keys else ""
-                st.markdown(
-                    f'<div class="meta-line">PAGE {s.get("page", "N/A")} &middot; SCORE {s.get("score", "N/A")}{overlap}</div>'
-                    f'<div class="snippet">{html.escape(content[:220])}</div><div style="height:12px"></div>',
-                    unsafe_allow_html=True,
-                )
+            st.markdown(hybrid_html, unsafe_allow_html=True)
 
     with col_b:
         with st.container(border=True):
             st.markdown("**Dense-only** (no BM25)")
-            for d in dense_docs:
-                content = d.metadata.get("original_content", d.page_content)
-                overlap = " &middot; ALSO IN HYBRID" if _snippet_key(content) in hybrid_keys else ""
-                st.markdown(
-                    f'<div class="meta-line">PAGE {d.metadata.get("page", "N/A")} &middot; SCORE {d.metadata.get("rerank_score", "N/A")}{overlap}</div>'
-                    f'<div class="snippet">{html.escape(content[:220])}</div><div style="height:12px"></div>',
-                    unsafe_allow_html=True,
-                )
+            st.markdown(dense_html, unsafe_allow_html=True)
 
 
 def render_ask_tab():
@@ -574,7 +490,7 @@ def render_ask_tab():
     st.write("")
     _section_label("ANSWER", "check")
     st.markdown(
-        f'<div class="answer-card">{_format_answer_html(result.get("result", ""))}</div>',
+        f'<div class="answer-card">{format_answer_html(result.get("result", ""))}</div>',
         unsafe_allow_html=True,
     )
 

@@ -13,17 +13,20 @@ logging.basicConfig(
 )
 
 import gradio as gr  # noqa: E402
+import html  # noqa: E402
 import os  # noqa: E402
 import re  # noqa: E402
 import time  # noqa: E402
 import tempfile  # noqa: E402
 from datetime import datetime  # noqa: E402
+from functools import partial  # noqa: E402
 from app.rag_pipeline import (  # noqa: E402
     build_vector_store,
     make_qa_chain,
     check_input_guard,
     redact_pii,
     evaluate_rag_response,
+    dense_only_retrieve,
     _SUPPORTED_EXTENSIONS,
     Config,
 )
@@ -39,7 +42,15 @@ from app.report_formatting import (  # noqa: E402
     format_retrieval_eval,
     format_ragas_eval,
     format_citation_verification,
+    format_answer_html,
+    format_bar_html,
+    format_source_detail_html,
+    format_comparison_html,
 )
+from app.golden_eval_summary import load_golden_eval_summary  # noqa: E402
+
+MAX_SOURCE_BUTTONS = 6
+_BLANK_ANSWER_HTML = '<div class="answer-card"><p style="color:#C8A080;">No answer yet.</p></div>'
 
 
 def strip_emojis(text):
@@ -63,7 +74,7 @@ def strip_emojis(text):
 
 
 # ---------- Global State ----------
-loaded_docs = {}          # {name: qa_chain}
+loaded_docs = {}          # {name: {"chain": QAChainWrapper, "vs": vector_store}}
 current_doc_name = None
 question_count = 0
 last_eval_data = {"question": "", "answer": "", "contexts": [], "sources": []}   # for RAGAS + citation verification buttons
@@ -74,7 +85,7 @@ def format_stats():
     cache_info = ""
     feedback_info = ""
     if current_doc_name and current_doc_name in loaded_docs:
-        chain = loaded_docs[current_doc_name]
+        chain = loaded_docs[current_doc_name]["chain"]
         size = chain.cache_size()
         backend = chain._cache.backend if hasattr(chain, "_cache") else "memory"
         cache_info = f"  |  Cache [{backend}]: {size} entries"
@@ -90,11 +101,43 @@ def format_stats():
     )
 
 
+def _no_source_buttons():
+    return [gr.update(visible=False) for _ in range(MAX_SOURCE_BUTTONS)]
+
+
+def _source_buttons_for(sources, selected=None):
+    updates = []
+    for i in range(MAX_SOURCE_BUTTONS):
+        if i < len(sources):
+            chunk_num = sources[i]["chunk"]
+            updates.append(gr.update(
+                value=f"Source {chunk_num}",
+                visible=True,
+                variant="primary" if selected == chunk_num else "secondary",
+            ))
+        else:
+            updates.append(gr.update(visible=False))
+    return updates
+
+
+def _reset_answer_panels():
+    """(answer_html, meta_line_html, confidence_html, sources_state,
+    selected_source_state, 6x source buttons, source_detail_html,
+    comparison_hybrid_html, comparison_dense_html) -- used whenever the
+    active document changes so a stale answer/source set from a different
+    document can't linger on screen."""
+    return (
+        _BLANK_ANSWER_HTML, "", "", [], None,
+        *_no_source_buttons(),
+        "", "", "",
+    )
+
+
 def load_document(doc_file):
     global loaded_docs, current_doc_name
 
     if doc_file is None:
-        return "No file uploaded.", gr.update(), format_stats(), ""
+        return ("No file uploaded.", gr.update(), format_stats(), "", *_reset_answer_panels())
 
     name = os.path.basename(doc_file.name)
     ext = os.path.splitext(name)[1].lower()
@@ -103,9 +146,7 @@ def load_document(doc_file):
         supported = ", ".join(sorted(_SUPPORTED_EXTENSIONS))
         return (
             f"Unsupported file type '{ext}'. Supported: {supported}",
-            gr.update(),
-            format_stats(),
-            "",
+            gr.update(), format_stats(), "", *_reset_answer_panels(),
         )
 
     try:
@@ -115,7 +156,7 @@ def load_document(doc_file):
         vector_store, all_chunks = build_vector_store(doc_file.name, store_path, doc_id=name)
         qa_chain = make_qa_chain(vector_store, doc_id=name, all_chunks=all_chunks)
 
-        loaded_docs[name] = qa_chain
+        loaded_docs[name] = {"chain": qa_chain, "vs": vector_store}
         current_doc_name = name
 
         choices = list(loaded_docs.keys())
@@ -124,10 +165,13 @@ def load_document(doc_file):
         if restored_history:
             status += " (conversation history restored)"
 
-        return status, gr.update(choices=choices, value=name), format_stats(), restored_history
+        return (
+            status, gr.update(choices=choices, value=name), format_stats(), restored_history,
+            *_reset_answer_panels(),
+        )
 
     except Exception as e:
-        return f"Failed to load document: {str(e)}", gr.update(), format_stats(), ""
+        return (f"Failed to load document: {str(e)}", gr.update(), format_stats(), "", *_reset_answer_panels())
 
 
 def switch_document(selected_name):
@@ -135,52 +179,74 @@ def switch_document(selected_name):
     if selected_name and selected_name in loaded_docs:
         current_doc_name = selected_name
         history = _load_history(selected_name)
-        return f"Switched to: '{selected_name}'", history
-    return "Document not found.", ""
+        return (f"Switched to: '{selected_name}'", history, *_reset_answer_panels())
+    return ("Document not found.", "", *_reset_answer_panels())
 
 
 def clear_cache():
     """Clear the semantic cache for the active document."""
     if current_doc_name and current_doc_name in loaded_docs:
-        loaded_docs[current_doc_name].clear_cache()
+        loaded_docs[current_doc_name]["chain"].clear_cache()
         return f"Cache cleared for '{current_doc_name}'.", format_stats()
     return "No document loaded.", format_stats()
 
 
 def ask_question(question, history_text):
-    """Generator — streams answer tokens and updates UI in real time."""
+    """Generator — streams answer tokens and updates UI in real time.
+
+    Yields a fixed-shape tuple matching _ASK_OUTPUTS every time (Gradio
+    requires consistent output arity across a generator's yields); slots not
+    relevant to a given branch (e.g. confidence/sources on an early-return)
+    are left untouched via gr.update() no-ops.
+    """
     global question_count, last_eval_data
 
+    NOOP = gr.update()
+    NOOP_BTNS = [gr.update() for _ in range(MAX_SOURCE_BUTTONS)]
+
     if not question.strip():
-        yield "", history_text, "", "", format_stats()
+        yield "", history_text, NOOP, NOOP, NOOP, NOOP, NOOP, *NOOP_BTNS, NOOP, NOOP, NOOP, format_stats()
         return
 
     # Input Guard
     is_safe, reason = check_input_guard(question)
     if not is_safe:
-        blocked_msg = f"[Input Guard] {reason}"
         yield (
-            "",
-            history_text,
-            blocked_msg,
-            "[Input Guard] Request blocked before retrieval.",
-            format_stats(),
+            "", history_text,
+            f'<div class="answer-card"><p>[Input Guard] {html.escape(reason)}</p></div>',
+            '<div class="meta-line">Request blocked before retrieval.</div>',
+            NOOP, NOOP, NOOP, *NOOP_BTNS, NOOP, NOOP, NOOP, format_stats(),
         )
         return
 
     if current_doc_name is None or current_doc_name not in loaded_docs:
-        yield "", history_text, "Please load a document first using Step 1.", "", format_stats()
+        yield (
+            "", history_text,
+            '<div class="answer-card"><p>Please load a document first using Step 1.</p></div>',
+            "", NOOP, NOOP, NOOP, *NOOP_BTNS, NOOP, NOOP, NOOP, format_stats(),
+        )
         return
 
-    qa_chain = loaded_docs[current_doc_name]
+    qa_chain = loaded_docs[current_doc_name]["chain"]
+    vector_store = loaded_docs[current_doc_name]["vs"]
     recent_history = history_text[-500:] if len(history_text) > 500 else history_text
 
-    # Show immediate "thinking" state
     t_start = time.time()
-    yield "", history_text, "", "Retrieving and reranking...", format_stats()
+    yield (
+        "", history_text,
+        '<div class="answer-card"><p style="color:#C8A080;">Retrieving and reranking...</p></div>',
+        "", NOOP, NOOP, NOOP, *NOOP_BTNS, NOOP, NOOP, NOOP, format_stats(),
+    )
 
     answer = ""
-    sources_text = ""
+    sources = []
+    answer_html_val = _BLANK_ANSWER_HTML
+    meta_html_val = ""
+    confidence_html_val = ""
+    btn_updates = _no_source_buttons()
+    detail_html = ""
+    hybrid_html = ""
+    dense_html = ""
     t_retrieval_done = None
 
     try:
@@ -191,12 +257,19 @@ def ask_question(question, history_text):
                 if t_retrieval_done is None:
                     t_retrieval_done = time.time()  # first token = retrieval done
                 answer = strip_emojis(update["result"])
-                yield "", history_text, answer, "Generating...", format_stats()
+                yield (
+                    "", history_text, f'<div class="answer-card">{format_answer_html(answer)}</div>',
+                    '<div class="meta-line">Generating...</div>',
+                    NOOP, NOOP, NOOP, *NOOP_BTNS, NOOP, NOOP, NOOP, format_stats(),
+                )
             else:
                 final_update = update
 
         if final_update is None:
-            yield "", history_text, "No response generated.", "", format_stats()
+            yield (
+                "", history_text, '<div class="answer-card"><p>No response generated.</p></div>',
+                "", NOOP, NOOP, NOOP, *NOOP_BTNS, NOOP, NOOP, NOOP, format_stats(),
+            )
             return
 
         raw_answer = final_update["result"]
@@ -209,8 +282,13 @@ def ask_question(question, history_text):
         # Output Guard — redact PII from the generated answer
         clean_answer, redacted_types = redact_pii(raw_answer)
         answer = strip_emojis(clean_answer)
+        answer_html_val = f'<div class="answer-card">{format_answer_html(answer)}</div>'
 
-        # Build sources panel header with all metadata labels
+        # Meta line — CRAG grade / query type / cache hit / PII / latency.
+        # Streamlit's dashboard doesn't surface these, but they're kept here
+        # since they're the concrete evidence behind the header tagline's own
+        # claims (CRAG grading, semantic cache) — dropping them would make
+        # the tagline nothing you can actually see working.
         labels = []
         if cache_hit:
             labels.append("CACHE HIT")
@@ -218,59 +296,54 @@ def ask_question(question, history_text):
             labels.append(f"CRAG: {grade}")
         if query_type and query_type != "N/A":
             labels.append(f"Type: {query_type}")
-        if confidence.get("composite") is not None:
-            labels.append(f"Confidence: {confidence['composite']:.2f}")
         if redacted_types:
-            labels.append(f"PII Redacted: {', '.join(set(redacted_types))}")
+            labels.append(f"PII redacted: {', '.join(sorted(set(redacted_types)))}")
 
-        header = f"[{' | '.join(labels)}]\n\n" if labels else ""
-
-        if sources:
-            sources_text = f"{header}Source chunks from '{current_doc_name}':\n\n"
-            for s in sources:
-                clean_content = strip_emojis(s["content"])
-                score_str = f"  -  Confidence: {s['score']}" if s.get("score") != "N/A" else ""
-                method = s.get("method", "")
-                method_str = f"  -  [{method.upper()}]" if method else ""
-                sources_text += (
-                    f"[Source {s['chunk']}  -  Page {s['page']}{score_str}{method_str}]\n"
-                    f"{clean_content}...\n\n{'- ' * 25}\n\n"
-                )
-        elif grade == "INCORRECT":
-            sources_text = f"{header}No relevant chunks found in document."
-        else:
-            sources_text = f"{header}No source chunks returned." if header else "No source chunks returned."
-
-        # Phase 3 — append latency breakdown to sources panel
         t_end = time.time()
         total_ms = int((t_end - t_start) * 1000)
-
         if cache_hit:
-            # Semantic cache hit — served without a new LLM call, so TTFT/tokens/sec
-            # don't apply. Say so explicitly instead of showing misleading zeros.
-            sources_text += (
-                f"\n\n{'- ' * 25}\n"
-                f"Latency — Served from semantic cache: {total_ms}ms (no new generation)"
-            )
+            labels.append(f"Served from semantic cache: {total_ms}ms")
         else:
             ttft_ms = int((t_retrieval_done - t_start) * 1000) if t_retrieval_done else 0
             generation_ms = total_ms - ttft_ms
-
             generated_tokens = (final_update or {}).get("generated_tokens", 0)
-            cached_tokens = (final_update or {}).get("cached_tokens", 0)
             tokens_per_sec = round(generated_tokens / (generation_ms / 1000), 1) if generation_ms > 0 and generated_tokens else 0.0
-            cache_str = f"  |  Prompt cache: {cached_tokens} tok" if cached_tokens else ""
+            labels.append(f"TTFT {ttft_ms}ms · Generation {generation_ms}ms · {tokens_per_sec} tok/s")
 
-            sources_text += (
-                f"\n\n{'- ' * 25}\n"
-                f"Latency — TTFT (incl. retrieval+rerank): {ttft_ms}ms  |  "
-                f"Generation: {generation_ms}ms  |  Total: {total_ms}ms\n"
-                f"{tokens_per_sec} tok/s  |  {generated_tokens} tokens generated{cache_str}"
-            )
+        meta_html_val = (
+            f'<div class="meta-line">{" &middot; ".join(html.escape(label) for label in labels)}</div>'
+            if labels else ""
+        )
+
+        # Confidence
+        if confidence:
+            composite = confidence.get("composite", 0)
+            bars = "".join([
+                format_bar_html("Retrieval", f"{confidence.get('retrieval', 0):.2f}", confidence.get("retrieval", 0)),
+                format_bar_html("Citation coverage", f"{confidence.get('citation_coverage', 0):.2f}", confidence.get("citation_coverage", 0)),
+                format_bar_html("Completeness", f"{confidence.get('completeness', 0):.2f}", confidence.get("completeness", 0)),
+            ])
+            confidence_html_val = f'<div class="confidence-composite">{composite:.2f}</div>{bars}'
+        else:
+            confidence_html_val = '<div class="snippet" style="color:#C8A080;">No confidence data.</div>'
+
+        # Sources + hybrid-vs-dense-only comparison
+        if sources:
+            btn_updates = _source_buttons_for(sources, selected=None)
+            try:
+                dense_docs, _dense_grade = dense_only_retrieve(vector_store, question)
+            except Exception:
+                dense_docs = []
+            hybrid_html, dense_html = format_comparison_html(sources, dense_docs)
+        elif grade == "INCORRECT":
+            detail_html = '<div class="snippet" style="color:#C8A080;">No relevant chunks found in document.</div>'
+        else:
+            detail_html = '<div class="snippet" style="color:#C8A080;">No source chunks returned.</div>'
 
     except Exception as e:
         answer = f"Error: {str(e)}"
-        sources_text = ""
+        answer_html_val = f'<div class="answer-card"><p>{html.escape(answer)}</p></div>'
+        sources = []
 
     question_count += 1
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -284,21 +357,45 @@ def ask_question(question, history_text):
     updated_history = history_text + new_entry
 
     # Store for RAGAS evaluation button + citation verification button
-    if final_update and final_update.get("sources"):
+    if sources:
         last_eval_data["question"] = question
         last_eval_data["answer"] = answer
-        last_eval_data["contexts"] = [s["content"] for s in final_update["sources"]]
-        last_eval_data["sources"] = final_update["sources"]
+        last_eval_data["contexts"] = [s["content"] for s in sources]
+        last_eval_data["sources"] = sources
 
     # Persist conversation history to Redis
     _save_history(current_doc_name, updated_history)
 
-    yield "", updated_history, answer, sources_text, format_stats()
+    yield (
+        "", updated_history, answer_html_val, meta_html_val,
+        confidence_html_val, sources, None,
+        *btn_updates,
+        detail_html, hybrid_html, dense_html,
+        format_stats(),
+    )
+
+
+def select_source(idx, sources, selected):
+    """idx is the 1-based position of the clicked button among the currently
+    visible source buttons, which matches the sources list's own order."""
+    if not sources or idx > len(sources):
+        return (selected, gr.update(), *[gr.update() for _ in range(MAX_SOURCE_BUTTONS)])
+
+    chunk_num = sources[idx - 1]["chunk"]
+    new_selected = None if selected == chunk_num else chunk_num
+
+    if new_selected is None:
+        detail = ""
+    else:
+        match = next((s for s in sources if s["chunk"] == new_selected), None)
+        detail = format_source_detail_html(match) if match else ""
+
+    return (new_selected, detail, *_source_buttons_for(sources, selected=new_selected))
 
 
 def clear_history():
     _delete_history(current_doc_name)
-    return "", "", ""
+    return ("", *_reset_answer_panels())
 
 
 def run_phase1_eval():
@@ -311,7 +408,7 @@ def run_phase1_eval():
     if current_doc_name is None or current_doc_name not in loaded_docs:
         return "Load a document first."
 
-    chain = loaded_docs[current_doc_name]
+    chain = loaded_docs[current_doc_name]["chain"]
     if not hasattr(chain, "run_retrieval_eval"):
         return "Retrieval eval not available on this chain."
 
@@ -383,6 +480,10 @@ _ICONS = {
     "document": f'<svg {_ICON_ATTRS}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>',
     "message": f'<svg {_ICON_ATTRS}><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>',
     "check": f'<svg {_ICON_ATTRS}><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+    "activity": f'<svg {_ICON_ATTRS}><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
+    "bookmark": f'<svg {_ICON_ATTRS}><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>',
+    "layers": f'<svg {_ICON_ATTRS}><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>',
+    "target": f'<svg {_ICON_ATTRS}><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
     "thumbsup": f'<svg {_ICON_ATTRS}><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg>',
     "grid": f'<svg {_ICON_ATTRS}><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
 }
@@ -574,25 +675,63 @@ textarea::placeholder, input[type=text]::placeholder {
     border-color: #FFD3AC !important;
 }
 
-/* ── Answer box ── */
-#answer-box textarea {
-    color: #3D1A06 !important;
-    font-size: 0.95em !important;
-    line-height: 1.78 !important;
+/* ── Answer card ── */
+.answer-card {
     background: #FFFEF8 !important;
-    border-color: #DBB06B !important;
-    border-left: 3px solid #DBB06B !important;
+    border: 1px solid #FFD3AC !important;
+    border-left: 4px solid #DBB06B !important;
+    border-radius: 10px !important;
+    padding: 22px 26px !important;
+    font-size: 1.06em !important;
+    line-height: 1.85 !important;
+    color: #3D1A06 !important;
+}
+.answer-card p { margin: 0 0 14px 0 !important; font-size: 1em !important; line-height: inherit !important; }
+.answer-card p:last-child { margin-bottom: 0 !important; }
+.answer-card .cite {
+    color: #C9713F !important;
+    font-weight: 700 !important;
+    font-size: 1.15em !important;
+    padding: 0 1px !important;
+}
+.answer-card .analogy {
+    display: block !important;
+    margin-top: 14px !important;
+    padding-top: 14px !important;
+    border-top: 1px dashed #FFD3AC !important;
+    color: #7A4020 !important;
+    font-style: italic !important;
 }
 
-/* ── Sources box ── */
-#sources-box textarea {
+/* ── Snippet / meta-line (sources, comparison, golden set) ── */
+.snippet {
+    font-size: 0.88em !important;
+    line-height: 1.7 !important;
+    color: #5A3010 !important;
+}
+.meta-line {
+    font-size: 0.78em !important;
+    color: #A06030 !important;
+    font-weight: 600 !important;
+    letter-spacing: 0.02em !important;
+    margin-bottom: 4px !important;
+}
+
+/* ── Card blocks (confidence, source detail, comparison, golden set) ── */
+.card-block {
+    background: #FFFFFF !important;
+    border: 1px solid #FFD3AC !important;
+    border-radius: 14px !important;
+    padding: 18px 20px !important;
+    box-shadow: 0 2px 14px rgba(219,176,107,0.10) !important;
+}
+.confidence-composite {
+    font-family: 'Fraunces', Georgia, serif !important;
+    font-size: 2.2em !important;
+    font-weight: 700 !important;
     color: #7A4020 !important;
-    font-size: 0.81em !important;
-    font-family: 'Courier New', monospace !important;
-    line-height: 1.58 !important;
-    background: #FFF5EE !important;
-    border-color: #FFD3AC !important;
-    border-left: 3px solid #FFB5AB !important;
+    line-height: 1 !important;
+    margin-bottom: 14px !important;
 }
 
 /* ── Load status ── */
@@ -786,196 +925,245 @@ with gr.Blocks(
             "CRAG grading &nbsp;·&nbsp; Semantic cache &nbsp;·&nbsp; PII redaction"
         )
 
-    stats_bar = gr.Textbox(
-        value=format_stats(),
-        label="Session Stats",
-        interactive=False,
-        lines=1,
-        elem_id="stats-bar",
-    )
-
-    # ── Step 1 — Document Upload ─────────────────────────────────
-    _section_header("STEP 1 — UPLOAD DOCUMENT", "document")
-
-    with gr.Row(equal_height=False):
-        with gr.Column(scale=5):
-            doc_input = gr.File(
-                label="Choose a document to upload",
-                file_types=_supported_ext_list,
-            )
-        with gr.Column(scale=4):
-            load_status = gr.Textbox(
-                label="Load Status",
-                value="No document loaded yet.",
-                interactive=False,
-                lines=5,
-                elem_id="load-status",
-            )
-
-    with gr.Row():
-        load_btn = gr.Button("Load Document", variant="primary", scale=2, size="lg")
-        doc_selector = gr.Dropdown(
-            label="Switch Active Document",
-            choices=[],
-            interactive=True,
-            scale=3,
-        )
-
-    gr.HTML("<hr/>")
-
-    # ── Step 2 — Chat ────────────────────────────────────────────
-    _section_header("STEP 2 — ASK QUESTIONS", "message")
-
-    conversation = gr.Textbox(
-        label="Conversation History",
-        value="",
-        interactive=False,
-        lines=13,
-        max_lines=13,
-        elem_id="chat-history",
-    )
-
-    with gr.Row(equal_height=True):
-        question_box = gr.Textbox(
-            label="Your Question",
-            placeholder="Ask anything about the loaded document...",
-            lines=2,
-            scale=6,
-            elem_id="question-input",
-        )
-        ask_btn = gr.Button("Ask", variant="primary", scale=1, size="lg", min_width=90)
-
-    with gr.Row():
-        clear_btn = gr.Button("Clear Conversation", size="sm", variant="secondary", scale=1)
-        clear_cache_btn = gr.Button("Clear Semantic Cache", size="sm", variant="secondary", scale=1)
-
-    gr.HTML("<hr/>")
-
-    # ── Answer & Sources ─────────────────────────────────────────
-    _section_header("LAST ANSWER & SOURCE CHUNKS", "check")
-
-    with gr.Row(equal_height=False):
-        with gr.Column(scale=1):
-            last_answer_box = gr.Textbox(
-                label="Generated Answer  [streams in real time]",
-                value="",
-                interactive=True,
-                lines=10,
-                elem_id="answer-box",
-            )
-        with gr.Column(scale=1):
-            sources_box = gr.Textbox(
-                label="Retrieved Chunks  [CRAG grade · Query type · Confidence · Latency]",
-                value="",
-                interactive=False,
-                lines=10,
-                elem_id="sources-box",
-            )
-
-    gr.HTML("<hr/>")
-
-    # ── Feedback ─────────────────────────────────────────────────
-    _section_header("RATE THE LAST ANSWER", "thumbsup")
-
-    with gr.Row():
-        thumbs_up_btn = gr.Button("Thumbs Up", variant="primary", size="sm", scale=1)
-        thumbs_down_btn = gr.Button("Thumbs Down", variant="stop", size="sm", scale=1)
-        feedback_status = gr.Textbox(
-            label="Feedback Status",
-            interactive=False,
-            scale=5,
-            lines=1,
-            elem_id="feedback-status",
-        )
-
-    gr.HTML("<hr/>")
-
-    # ── Step 3 — Evaluation ──────────────────────────────────────
-    _section_header("STEP 3 — EVALUATION", "grid")
-
     with gr.Tabs():
-        with gr.Tab("Phase 1 — Retrieval Eval"):
-            gr.Markdown(
-                "Generates synthetic questions from document chunks — measures **Precision@K · Recall@K · MRR · Coverage**.  \n"
-                "Takes ~20 seconds. No extra API keys needed."
+        with gr.Tab("PDF Upload"):
+            stats_bar = gr.Textbox(
+                value=format_stats(),
+                label="Session Stats",
+                interactive=False,
+                lines=1,
+                elem_id="stats-bar",
             )
+
+            # ── Step 1 — Document Upload ─────────────────────────
+            _section_header("STEP 1 — UPLOAD DOCUMENT", "document")
+
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=5):
+                    doc_input = gr.File(
+                        label="Choose a document to upload",
+                        file_types=_supported_ext_list,
+                    )
+                with gr.Column(scale=4):
+                    load_status = gr.Textbox(
+                        label="Load Status",
+                        value="No document loaded yet.",
+                        interactive=False,
+                        lines=5,
+                        elem_id="load-status",
+                    )
+
             with gr.Row():
-                phase1_btn = gr.Button("Run Retrieval Evaluation", variant="secondary", scale=1)
-                phase1_box = gr.Textbox(
-                    label="Retrieval Metrics",
-                    value="",
-                    interactive=False,
-                    lines=10,
+                load_btn = gr.Button("Load Document", variant="primary", scale=2, size="lg")
+                doc_selector = gr.Dropdown(
+                    label="Switch Active Document",
+                    choices=[],
+                    interactive=True,
                     scale=3,
-                    elem_id="phase1-box",
                 )
 
-        with gr.Tab("Phase 2 — RAGAS Eval"):
-            gr.Markdown(
-                "Scores the last answer on **Faithfulness · Answer Relevancy · Context Precision** via LLM-as-judge.  \n"
-                "Requires `RAGAS_EVAL=true` in `.env`. Uses your configured Groq LLM — takes 10-20 seconds."
+            gr.HTML("<hr/>")
+
+            # ── Step 2 — Chat ────────────────────────────────────
+            _section_header("STEP 2 — ASK QUESTIONS", "message")
+
+            conversation = gr.Textbox(
+                label="Conversation History",
+                value="",
+                interactive=False,
+                lines=13,
+                max_lines=13,
+                elem_id="chat-history",
             )
+
+            with gr.Row(equal_height=True):
+                question_box = gr.Textbox(
+                    label="Your Question",
+                    placeholder="Ask anything about the loaded document...",
+                    lines=2,
+                    scale=6,
+                    elem_id="question-input",
+                )
+                ask_btn = gr.Button("Ask", variant="primary", scale=1, size="lg", min_width=90)
+
             with gr.Row():
-                eval_btn = gr.Button("Evaluate Last Answer (RAGAS)", variant="secondary", scale=1)
-                eval_box = gr.Textbox(
-                    label="RAGAS Scores",
-                    value="",
+                clear_btn = gr.Button("Clear Conversation", size="sm", variant="secondary", scale=1)
+                clear_cache_btn = gr.Button("Clear Semantic Cache", size="sm", variant="secondary", scale=1)
+
+            gr.HTML("<hr/>")
+
+            # ── Answer ────────────────────────────────────────────
+            _section_header("ANSWER", "check")
+            answer_html = gr.HTML(value=_BLANK_ANSWER_HTML)
+            meta_line_html = gr.HTML(value="")
+
+            gr.HTML("<div style='height:8px'></div>")
+
+            # ── Confidence ────────────────────────────────────────
+            _section_header("CONFIDENCE", "activity")
+            confidence_html = gr.HTML(value="", elem_classes="card-block")
+
+            gr.HTML("<div style='height:8px'></div>")
+
+            # ── Sources (clickable citations) ───────────────────
+            _section_header("SOURCES", "bookmark")
+            gr.Markdown("Click a source to view the chunk it was cited from.")
+            with gr.Row():
+                src_btn_1 = gr.Button("Source 1", variant="secondary", visible=False)
+                src_btn_2 = gr.Button("Source 2", variant="secondary", visible=False)
+                src_btn_3 = gr.Button("Source 3", variant="secondary", visible=False)
+                src_btn_4 = gr.Button("Source 4", variant="secondary", visible=False)
+                src_btn_5 = gr.Button("Source 5", variant="secondary", visible=False)
+                src_btn_6 = gr.Button("Source 6", variant="secondary", visible=False)
+            source_detail_html = gr.HTML(value="", elem_classes="card-block")
+
+            gr.HTML("<div style='height:8px'></div>")
+
+            # ── Retrieval comparison ─────────────────────────────
+            _section_header("RETRIEVAL COMPARISON — HYBRID VS. DENSE-ONLY", "layers")
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("**Hybrid** (BM25 + dense, RRF-fused)")
+                    comparison_hybrid_html = gr.HTML(value="", elem_classes="card-block")
+                with gr.Column():
+                    gr.Markdown("**Dense-only** (no BM25)")
+                    comparison_dense_html = gr.HTML(value="", elem_classes="card-block")
+
+            sources_state = gr.State([])
+            selected_source_state = gr.State(None)
+
+            gr.HTML("<hr/>")
+
+            # ── Feedback ──────────────────────────────────────────
+            _section_header("RATE THE LAST ANSWER", "thumbsup")
+
+            with gr.Row():
+                thumbs_up_btn = gr.Button("Thumbs Up", variant="primary", size="sm", scale=1)
+                thumbs_down_btn = gr.Button("Thumbs Down", variant="stop", size="sm", scale=1)
+                feedback_status = gr.Textbox(
+                    label="Feedback Status",
                     interactive=False,
-                    lines=10,
-                    scale=3,
-                    elem_id="eval-box",
+                    scale=5,
+                    lines=1,
+                    elem_id="feedback-status",
                 )
 
-        with gr.Tab("Phase 4 — Citation Verification"):
-            gr.Markdown(
-                "Checks whether each cited superscript (¹²³) in the last answer is actually "
-                "supported by the source chunk it points to, and flags claims with no citation at all.  \n"
-                "Uses your configured LLM — one extra call per cited sentence, takes a few seconds."
-            )
-            with gr.Row():
-                verify_btn = gr.Button("Verify Citations (Last Answer)", variant="secondary", scale=1)
-                citation_box = gr.Textbox(
-                    label="Citation Verification",
-                    value="",
-                    interactive=False,
-                    lines=10,
-                    scale=3,
-                    elem_id="citation-box",
-                )
+            gr.HTML("<hr/>")
 
-    gr.Markdown(
-        "Built with [LangChain](https://langchain.com) · "
-        "[FAISS](https://github.com/facebookresearch/faiss) · "
-        "[BM25](https://github.com/dorianbrown/rank_bm25) · "
-        "[Gradio](https://gradio.app)",
-        elem_classes="footer-text",
-    )
+            # ── Step 3 — Evaluation ───────────────────────────────
+            _section_header("STEP 3 — EVALUATION", "grid")
+
+            with gr.Tabs():
+                with gr.Tab("Phase 1 — Retrieval Eval"):
+                    gr.Markdown(
+                        "Generates synthetic questions from document chunks — measures **Precision@K · Recall@K · MRR · Coverage**.  \n"
+                        "Takes ~20 seconds. No extra API keys needed."
+                    )
+                    with gr.Row():
+                        phase1_btn = gr.Button("Run Retrieval Evaluation", variant="secondary", scale=1)
+                        phase1_box = gr.Textbox(
+                            label="Retrieval Metrics",
+                            value="",
+                            interactive=False,
+                            lines=10,
+                            scale=3,
+                            elem_id="phase1-box",
+                        )
+
+                with gr.Tab("Phase 2 — RAGAS Eval"):
+                    gr.Markdown(
+                        "Scores the last answer on **Faithfulness · Answer Relevancy · Context Precision** via LLM-as-judge.  \n"
+                        "Requires `RAGAS_EVAL=true` in `.env`. Uses your configured Groq LLM — takes 10-20 seconds."
+                    )
+                    with gr.Row():
+                        eval_btn = gr.Button("Evaluate Last Answer (RAGAS)", variant="secondary", scale=1)
+                        eval_box = gr.Textbox(
+                            label="RAGAS Scores",
+                            value="",
+                            interactive=False,
+                            lines=10,
+                            scale=3,
+                            elem_id="eval-box",
+                        )
+
+                with gr.Tab("Phase 4 — Citation Verification"):
+                    gr.Markdown(
+                        "Checks whether each cited superscript (¹²³) in the last answer is actually "
+                        "supported by the source chunk it points to, and flags claims with no citation at all.  \n"
+                        "Uses your configured LLM — one extra call per cited sentence, takes a few seconds."
+                    )
+                    with gr.Row():
+                        verify_btn = gr.Button("Verify Citations (Last Answer)", variant="secondary", scale=1)
+                        citation_box = gr.Textbox(
+                            label="Citation Verification",
+                            value="",
+                            interactive=False,
+                            lines=10,
+                            scale=3,
+                            elem_id="citation-box",
+                        )
+
+            gr.Markdown(
+                "Built with [LangChain](https://langchain.com) · "
+                "[FAISS](https://github.com/facebookresearch/faiss) · "
+                "[BM25](https://github.com/dorianbrown/rank_bm25) · "
+                "[Gradio](https://gradio.app)",
+                elem_classes="footer-text",
+            )
+
+        with gr.Tab("Golden Set"):
+            _summary = load_golden_eval_summary()
+            if _summary is None:
+                gr.Markdown("No full golden eval run found. Run: `python run_golden_eval.py`")
+            else:
+                _correct, _total = _summary["overall"]
+                _section_header("OVERALL", "target")
+                gr.HTML(
+                    f'<div class="card-block"><div class="confidence-composite">{_correct / _total:.1%}</div>'
+                    f'<div class="snippet">{_correct}/{_total} questions &middot; last full run: {_summary["timestamp"]}</div></div>'
+                )
+                gr.HTML("<div style='height:12px'></div>")
+                _section_header("BY CATEGORY", "grid")
+                _cat_bars = "".join(
+                    format_bar_html(cat.replace("_", " "), f"{c}/{n} · {c / n:.0%}", c / n)
+                    for cat in ["lookup", "multi_hop", "no_answer", "ambiguous"]
+                    if cat in _summary["by_category"]
+                    for c, n in [_summary["by_category"][cat]]
+                )
+                gr.HTML(f'<div class="card-block">{_cat_bars}</div>')
 
     # ── Event wiring ─────────────────────────────────────────────
+    _panel_outputs = [
+        answer_html, meta_line_html, confidence_html, sources_state, selected_source_state,
+        src_btn_1, src_btn_2, src_btn_3, src_btn_4, src_btn_5, src_btn_6,
+        source_detail_html, comparison_hybrid_html, comparison_dense_html,
+    ]
+
     load_btn.click(
         fn=load_document,
         inputs=doc_input,
-        outputs=[load_status, doc_selector, stats_bar, conversation],
+        outputs=[load_status, doc_selector, stats_bar, conversation, *_panel_outputs],
     )
     doc_selector.change(
         fn=switch_document,
         inputs=doc_selector,
-        outputs=[load_status, conversation],
+        outputs=[load_status, conversation, *_panel_outputs],
     )
-    ask_btn.click(
-        fn=ask_question,
-        inputs=[question_box, conversation],
-        outputs=[question_box, conversation, last_answer_box, sources_box, stats_bar],
-    )
-    question_box.submit(
-        fn=ask_question,
-        inputs=[question_box, conversation],
-        outputs=[question_box, conversation, last_answer_box, sources_box, stats_bar],
-    )
+    _ask_outputs = [question_box, conversation, *_panel_outputs, stats_bar]
+    ask_btn.click(fn=ask_question, inputs=[question_box, conversation], outputs=_ask_outputs)
+    question_box.submit(fn=ask_question, inputs=[question_box, conversation], outputs=_ask_outputs)
+
+    for _i, _btn in enumerate([src_btn_1, src_btn_2, src_btn_3, src_btn_4, src_btn_5, src_btn_6], start=1):
+        _btn.click(
+            fn=partial(select_source, _i),
+            inputs=[sources_state, selected_source_state],
+            outputs=[selected_source_state, source_detail_html, src_btn_1, src_btn_2, src_btn_3, src_btn_4, src_btn_5, src_btn_6],
+        )
+
     clear_btn.click(
         fn=clear_history,
         inputs=[],
-        outputs=[conversation, last_answer_box, sources_box],
+        outputs=[conversation, *_panel_outputs],
     )
     clear_cache_btn.click(
         fn=clear_cache,
