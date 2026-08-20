@@ -571,6 +571,29 @@ def run_citation_verification():
 _supported_ext_list = sorted(_SUPPORTED_EXTENSIONS)
 _file_types_display = ", ".join(_supported_ext_list)
 
+# Outline icons (Feather-style: stroke-based, no fill) -- same set as
+# streamlit_app.py, used next to section labels instead of emoji.
+_ICON_ATTRS = 'width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"'
+_ICONS = {
+    "document": f'<svg {_ICON_ATTRS}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>',
+    "message": f'<svg {_ICON_ATTRS}><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>',
+    "check": f'<svg {_ICON_ATTRS}><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+    "thumbsup": f'<svg {_ICON_ATTRS}><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg>',
+    "grid": f'<svg {_ICON_ATTRS}><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
+}
+
+
+def _section_header(text: str, icon: str = None):
+    icon_html = _ICONS.get(icon, "") if icon else ""
+    return gr.HTML(f'<div class="section-header">{icon_html}{text}</div>')
+
+
+_HEAD = """
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+"""
+
 # Palette: #FFD3AC (light peach) · #FFB5AB (rose) · #E39A7B (terracotta) · #DBB06B (gold)
 _THEME = gr.themes.Soft(
     primary_hue=gr.themes.colors.orange,
@@ -627,9 +650,20 @@ _THEME = gr.themes.Soft(
 )
 
 _CSS = """
+/* ── Fonts ── */
+gradio-app, .gradio-container, body, button, input, textarea, select {
+    font-family: 'Plus Jakarta Sans', -apple-system, sans-serif !important;
+}
+
 /* ── Page ── */
 gradio-app, .gradio-container {
-    background: linear-gradient(160deg, #FFF8F2 0%, #FFF0E6 50%, #FFE8DA 100%) !important;
+    background:
+        radial-gradient(640px circle at 12% 8%, rgba(219,176,107,0.22), transparent 60%),
+        radial-gradient(720px circle at 88% 6%, rgba(227,154,123,0.20), transparent 60%),
+        radial-gradient(680px circle at 78% 92%, rgba(255,181,171,0.20), transparent 60%),
+        radial-gradient(600px circle at 8% 88%, rgba(219,176,107,0.16), transparent 60%),
+        linear-gradient(160deg, #FFF8F2 0%, #FFF0E6 50%, #FFE8DA 100%) !important;
+    background-attachment: fixed !important;
     min-height: 100vh !important;
 }
 .gradio-container {
@@ -648,9 +682,10 @@ gradio-app, .gradio-container {
     text-align: center !important;
 }
 .app-header h1 {
+    font-family: 'Fraunces', Georgia, serif !important;
     color: #FFFFFF !important;
-    font-size: 2.3em !important;
-    font-weight: 800 !important;
+    font-size: 2.4em !important;
+    font-weight: 700 !important;
     letter-spacing: -0.5px !important;
     margin: 0 0 8px 0 !important;
     text-shadow: 0 2px 8px rgba(100,40,10,0.18) !important;
@@ -664,6 +699,9 @@ gradio-app, .gradio-container {
 
 /* ── Section headers ── */
 .section-header {
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 7px !important;
     background: linear-gradient(135deg, #E39A7B 0%, #DBB06B 100%) !important;
     color: #FFFFFF !important;
     font-size: 0.74em !important;
@@ -676,6 +714,7 @@ gradio-app, .gradio-container {
     margin-bottom: 4px !important;
     box-shadow: 0 2px 8px rgba(227,154,123,0.22) !important;
 }
+.section-header svg { flex-shrink: 0 !important; }
 
 /* ── Stats bar ── */
 #stats-bar textarea {
@@ -951,7 +990,7 @@ with gr.Blocks(
     )
 
     # ── Step 1 — Document Upload ─────────────────────────────────
-    gr.Markdown("STEP 1 — UPLOAD DOCUMENT", elem_classes="section-header")
+    _section_header("STEP 1 — UPLOAD DOCUMENT", "document")
 
     with gr.Row(equal_height=False):
         with gr.Column(scale=5):
@@ -980,7 +1019,7 @@ with gr.Blocks(
     gr.HTML("<hr/>")
 
     # ── Step 2 — Chat ────────────────────────────────────────────
-    gr.Markdown("STEP 2 — ASK QUESTIONS", elem_classes="section-header")
+    _section_header("STEP 2 — ASK QUESTIONS", "message")
 
     conversation = gr.Textbox(
         label="Conversation History",
@@ -1008,7 +1047,7 @@ with gr.Blocks(
     gr.HTML("<hr/>")
 
     # ── Answer & Sources ─────────────────────────────────────────
-    gr.Markdown("LAST ANSWER & SOURCE CHUNKS", elem_classes="section-header")
+    _section_header("LAST ANSWER & SOURCE CHUNKS", "check")
 
     with gr.Row(equal_height=False):
         with gr.Column(scale=1):
@@ -1031,7 +1070,7 @@ with gr.Blocks(
     gr.HTML("<hr/>")
 
     # ── Feedback ─────────────────────────────────────────────────
-    gr.Markdown("RATE THE LAST ANSWER", elem_classes="section-header")
+    _section_header("RATE THE LAST ANSWER", "thumbsup")
 
     with gr.Row():
         thumbs_up_btn = gr.Button("Thumbs Up", variant="primary", size="sm", scale=1)
@@ -1047,7 +1086,7 @@ with gr.Blocks(
     gr.HTML("<hr/>")
 
     # ── Step 3 — Evaluation ──────────────────────────────────────
-    gr.Markdown("STEP 3 — EVALUATION", elem_classes="section-header")
+    _section_header("STEP 3 — EVALUATION", "grid")
 
     with gr.Tabs():
         with gr.Tab("Phase 1 — Retrieval Eval"):
@@ -1147,4 +1186,4 @@ with gr.Blocks(
 
 if __name__ == "__main__":
     demo.queue()
-    demo.launch(theme=_THEME, css=_CSS)
+    demo.launch(theme=_THEME, css=_CSS, head=_HEAD)
