@@ -797,7 +797,12 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
 
                 standalone_q, graded_docs, grade, sub_query_count = self._preprocess(inputs)
 
-                if grade in ("INCORRECT", "AMBIGUOUS") or not graded_docs:
+                # AMBIGUOUS retrieval still answers -- compute_confidence() already
+                # scores AMBIGUOUS lower (0.4 vs CORRECT's 1.0) precisely so a
+                # borderline-but-real match surfaces as a lower-confidence answer
+                # instead of a refusal. Only a genuinely empty/INCORRECT retrieval
+                # refuses.
+                if grade == "INCORRECT" or not graded_docs:
                     refusal_grade = grade if graded_docs else "INCORRECT"
                     refusal_msg = (
                         "This question is not covered in the loaded document. "
@@ -900,7 +905,12 @@ def make_qa_chain(vector_store, doc_id: str = "default", all_chunks: list = None
                     }
                     return
 
-                if grade in ("INCORRECT", "AMBIGUOUS") or not graded_docs:
+                # AMBIGUOUS retrieval still answers -- compute_confidence() already
+                # scores AMBIGUOUS lower (0.4 vs CORRECT's 1.0) precisely so a
+                # borderline-but-real match surfaces as a lower-confidence answer
+                # instead of a refusal. Only a genuinely empty/INCORRECT retrieval
+                # refuses.
+                if grade == "INCORRECT" or not graded_docs:
                     msg = (
                         "This question is not covered in the loaded document. "
                         "Please ask something about the document content."
