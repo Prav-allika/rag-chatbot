@@ -12,7 +12,7 @@ pinned: false
 
 A production-grade Retrieval-Augmented Generation chatbot. Upload any document and ask questions about it. Built with LangChain, Groq/OpenAI LLMs, FAISS, Qdrant, and Gradio.
 
-**Live Demo**: [huggingface.co/spaces/Prav04/rag-chatbot](https://huggingface.co/spaces/Prav04/rag-chatbot)
+**Live Demo**: [huggingface.co/spaces/Prav04/rag-chatbot](https://huggingface.co/spacest/Prav04/rag-chatbot)
 
 ---
 
@@ -29,8 +29,8 @@ A production-grade Retrieval-Augmented Generation chatbot. Upload any document a
 - Hybrid BM25 + FAISS dense retrieval with configurably-weighted Reciprocal Rank Fusion (`RRF_DENSE_WEIGHT`)
 - Contextual Retrieval (optional) — LLM-generated situating context prepended to each chunk before embedding, improves recall on chunks that read as ambiguous in isolation
 - Cross-encoder reranking (ms-marco-MiniLM-L-6-v2)
-- CRAG grading — out-of-scope questions are blocked before reaching the LLM
-- Query condensation — follow-up questions rewritten as standalone before retrieval
+- CRAG grading — genuinely out-of-scope questions (INCORRECT grade) are blocked before reaching the LLM, at zero generation cost; borderline retrieval (AMBIGUOUS grade) still answers, just with a visibly lower composite confidence score instead of being refused
+- Query condensation — follow-up questions resolved against chat history and rewritten as standalone before retrieval; a question that's already standalone is returned unchanged rather than rewritten
 - Query decomposition — complex multi-part questions split into focused sub-queries, each reranked against itself and interleaved before the final cut (so one sub-topic's chunks can't crowd out another's)
 - HyDE (Hypothetical Document Embeddings) — optional, improves conceptual recall
 - Query routing — FACTUAL / CONCEPTUAL / COMPARATIVE prompts selected automatically (CONCEPTUAL may add one original, clearly-labeled analogy beyond the source text); all three permit connecting multiple explicitly-stated facts across source chunks (synthesis), while still prohibiting invented facts
@@ -43,6 +43,7 @@ A production-grade Retrieval-Augmented Generation chatbot. Upload any document a
 - Semantic cache backed by Redis (persistent across restarts)
 - In-memory LRU fallback when Redis is unavailable
 - Cosine similarity threshold — similar questions served from cache instantly
+- Refusals are never cached — a low-confidence or "not covered" response isn't memoized as if it were a stable fact about the document, so it can't get replayed to a later question that would otherwise retrieve correctly
 
 **Safety and quality**
 - Input guard — blocks prompt injection, jailbreaks, and harmful content
@@ -224,7 +225,8 @@ Complex questions decomposed into sub-queries
 Hybrid retrieval: BM25 + FAISS/Qdrant dense -> weighted RRF fusion (RRF_DENSE_WEIGHT)
 Cross-encoder reranker scores all candidates
 CRAG grader: CORRECT / AMBIGUOUS / INCORRECT
-  AMBIGUOUS or INCORRECT -> refuse immediately (no LLM call)
+  INCORRECT -> refuse immediately (no LLM call)
+  AMBIGUOUS -> still answers, at a lower composite confidence score
          |
          v
 Query routed: FACTUAL / CONCEPTUAL / COMPARATIVE
@@ -261,8 +263,8 @@ All settings are in `env.example`. Key knobs:
 | `RRF_DENSE_WEIGHT`         | 0.5                              | Dense weight in RRF fusion (sparse = 1 - this); 0.5 = unweighted |
 | `RETRIEVAL_K`              | 3                                | Final chunks passed to LLM after rerank   |
 | `RETRIEVAL_K_INITIAL`      | 10                               | Candidates fetched before reranking       |
-| `GRADE_CORRECT_THRESHOLD`  | -2.0                             | Min reranker score to answer              |
-| `GRADE_AMBIGUOUS_THRESHOLD`| -5.0                             | Min score to even pass to LLM             |
+| `GRADE_CORRECT_THRESHOLD`  | -2.0                             | Min reranker score graded CORRECT (full-confidence answer) |
+| `GRADE_AMBIGUOUS_THRESHOLD`| -5.0                             | Min score to answer at all — below this, refuse before generation; at/above but under `GRADE_CORRECT_THRESHOLD`, answer at a lower confidence (AMBIGUOUS) |
 | `SEMANTIC_CACHE_THRESHOLD` | 0.92                             | Cosine similarity for cache hit           |
 | `CONDENSE_QUESTIONS`       | true                             | Rewrite follow-ups before retrieval       |
 | `DECOMPOSE_QUERIES`        | true                             | Split complex questions into sub-queries  |
@@ -390,6 +392,14 @@ Each uploaded document gets its own isolated Qdrant collection (or FAISS index o
    - `GROQ_API_KEY` or `OPENAI_API_KEY` (at least one required — set `OPENAI_MODEL`/`GROQ_MODEL` explicitly, see LLM Options above)
    - `QDRANT_URL` and `QDRANT_API_KEY` (optional — for persistent vector storage)
    - `REDIS_URL` (optional — for persistent cache and history)
+
+---
+
+## Known Limitations
+
+- **Semantic cache is scoped to document + question similarity, not per-user or per-session.** This is deliberate — it's what makes repeated questions across different users instant — but it means the cache has no concept of "who's asking." Refusals are excluded from caching (see Caching above) specifically because a cached refusal is the case most likely to be wrong and most damaging to replay; a cached real answer is much lower-risk to reuse across sessions.
+- **Query condensation is prompt-guided, not classifier-gated.** Every question passes through the same LLM rewrite step; the prompt instructs the model to leave already-standalone questions untouched rather than routing them around rewriting entirely. This is simpler to reason about than a separate classifier, at the cost of depending on the LLM reliably following that instruction.
+- **Table extraction has a known geometric edge case** — row-group labels that are vertically centered across several rows in the source PDF can get attributed to the wrong row once flattened to text. Diagnosed via the golden eval suite, not yet fixed.
 
 ---
 
